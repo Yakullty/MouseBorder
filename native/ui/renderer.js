@@ -1,0 +1,11 @@
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const $ = id => document.getElementById(id);
+const STATUS={connected:'已连接',connecting:'连接中',retrying:'重连中'};
+const HOOK={running:'运行中',failed:'未启动',stopped:'已停止'};
+let current={};
+function paint(s){current={...current,...s};$('hostname').textContent=current.hostname||'MouseBorder';$('pin').textContent=current.pin||'------';$('platform').textContent=navigator.platform;const connected=current.status==='connected';$('status').textContent=STATUS[current.status]||'等待配对';$('status').className='badge '+(connected?'on':'');$('edgeEnabled').checked=current.edge_enabled!==false;$('clipboard').checked=current.clipboard_enabled!==false;if(current.edge)$('edge').value=current.edge;$('hookState').textContent=HOOK[current.hook]||'未启动';$('hookState').className='badge '+(current.hook==='running'?'on':'');const box=$('connected');if(connected){box.textContent=`已连接到 ${current.peer} `;const b=document.createElement('button');b.className='button secondary';b.textContent='断开';b.onclick=()=>invoke('disconnect');box.appendChild(b);box.classList.remove('hidden')}else box.classList.add('hidden');if(current.error){$('error').textContent=current.error;$('error').classList.remove('hidden')}else $('error').classList.add('hidden')}
+invoke('get_state').then(paint);listen('state',e=>paint(e.payload));
+$('refreshPin').onclick=async()=>{const pin=await invoke('refresh_pin');$('pin').textContent=pin};
+$('connect').onclick=async()=>{const host=$('ip').value.trim(),pin=$('pairPin').value.trim();if(!host||!/^[0-9]{6}$/.test(pin)){$('error').textContent='请输入对方 IP 和六位配对码';$('error').classList.remove('hidden');return}$('error').classList.add('hidden');await invoke('connect_peer',{host,pin})};
+$('edge').addEventListener('change',()=>invoke('set_edge',{side:$('edge').value}));$('edgeEnabled').addEventListener('change',()=>invoke('set_enabled',{enabled:$('edgeEnabled').checked}));$('clipboard').addEventListener('change',()=>invoke('set_clipboard',{enabled:$('clipboard').checked}));$('retryHook').addEventListener('click',async()=>{$('hookState').textContent='重试中';$('hookState').className='badge';await invoke('retry_hook')});
