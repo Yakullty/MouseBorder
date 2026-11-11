@@ -111,8 +111,8 @@ extern "C" fn on_event(_proxy: u32, event_type: u32, event: Ref, refcon: Ref) ->
         OTHER_DOWN => input::Raw::Button { button: Button::Middle, down: true },
         OTHER_UP => input::Raw::Button { button: Button::Middle, down: false },
         SCROLL_WHEEL => input::Raw::Wheel {
-            dx: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) },
-            dy: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) },
+            dx: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) } * input::WHEEL_TICKS_PER_UNIT,
+            dy: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) } * input::WHEEL_TICKS_PER_UNIT,
         },
         KEY_DOWN => input::Raw::Key { code: key_from_code(unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) }), down: true },
         KEY_UP => input::Raw::Key { code: key_from_code(unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) }), down: false },

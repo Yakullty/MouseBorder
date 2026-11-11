@@ -19,7 +19,7 @@ const PEER_PORT_ENV: &str = "MOUSEBORDER_PEER_PORT";
 const PIN_ENV: &str = "MOUSEBORDER_PIN";
 
 #[derive(Clone, Serialize)]
-pub struct UiState { pub hostname:String, pub pin:String, pub status:String, pub peer:String, pub edge:String, pub error:String, pub edge_enabled:bool, pub clipboard_enabled:bool, pub hook:String }
+pub struct UiState { pub hostname:String, pub pin:String, pub status:String, pub peer:String, pub edge:String, pub error:String, pub edge_enabled:bool, pub clipboard_enabled:bool, pub hook:String, pub control:String }
 #[derive(Serialize, Deserialize, Clone)]
 struct Packet { mac:String, body:Message }
 
@@ -41,10 +41,10 @@ const HOOK_STOPPED: u8 = 0; const HOOK_RUNNING: u8 = 1; const HOOK_FAILED: u8 = 
 impl Core {
     pub fn new()->Arc<Self>{
         let hostname=std::env::var("COMPUTERNAME").or_else(|_|std::env::var("HOSTNAME")).unwrap_or_else(|_|"MouseBorder".into());
-        let pin=initial_pin(); let dims=screen_size(); let hook=HookState::new();
-        hook.set_screen(dims.0,dims.1);
+        let pin=initial_pin(); let (sx,sy,sw,sh)=screen_rect(); let hook=HookState::new();
+        hook.set_screen(sx,sy,sw,sh);
         let defaults=Settings::default();
-        Arc::new(Self{ui:Mutex::new(UiState{hostname,pin:pin.clone(),status:"waiting".into(),peer:String::new(),edge:defaults.edge.clone(),error:String::new(),edge_enabled:defaults.edge_enabled,clipboard_enabled:defaults.clipboard_enabled,hook:"stopped".into()}),pin:RwLock::new(pin),out:Mutex::new(None),hook,app:Mutex::new(None),clipboard_echo:Mutex::new(String::new()),edge_enabled:AtomicBool::new(defaults.edge_enabled),clipboard_enabled:AtomicBool::new(defaults.clipboard_enabled),target:Mutex::new(None),link:AtomicUsize::new(0),capture:Mutex::new(None),hook_state:AtomicU8::new(HOOK_STOPPED)})
+        Arc::new(Self{ui:Mutex::new(UiState{hostname,pin:pin.clone(),status:"waiting".into(),peer:String::new(),edge:defaults.edge.clone(),error:String::new(),edge_enabled:defaults.edge_enabled,clipboard_enabled:defaults.clipboard_enabled,hook:"stopped".into(),control:"local".into()}),pin:RwLock::new(pin),out:Mutex::new(None),hook,app:Mutex::new(None),clipboard_echo:Mutex::new(String::new()),edge_enabled:AtomicBool::new(defaults.edge_enabled),clipboard_enabled:AtomicBool::new(defaults.clipboard_enabled),target:Mutex::new(None),link:AtomicUsize::new(0),capture:Mutex::new(None),hook_state:AtomicU8::new(HOOK_STOPPED)})
     }
     pub fn set_app(&self,a:AppHandle){*self.app.lock().unwrap()=Some(a.clone());if let Some(s)=read_settings(&settings_path(&a)){self.apply_settings(&s);}}
     fn apply_settings(&self,s:&Settings){
@@ -63,14 +63,16 @@ impl Core {
     fn update(&self,f:impl FnOnce(&mut UiState)){let mut s=self.ui.lock().unwrap();f(&mut s);if let Some(a)=self.app.lock().unwrap().as_ref(){let _=a.emit("state",s.clone());}}
     pub fn refresh_pin(&self)->String{let p=make_pin();*self.pin.write().unwrap()=p.clone();self.update(|s|s.pin=p.clone());p}
     pub fn set_edge(&self,side:String){if let Some(edge)=input::Edge::parse(&side){self.hook.set_edge(edge);self.update(|s|s.edge=edge.as_str().to_string());self.persist();}}
-    pub fn set_edge_enabled(&self,on:bool){self.edge_enabled.store(on,Ordering::SeqCst);self.hook.enabled.store(on&&self.ui.lock().unwrap().status=="connected",Ordering::SeqCst);if !on{input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.send(Message::ReturnControl);}self.update(|s|s.edge_enabled=on);self.persist();}
+    pub fn set_edge_enabled(&self,on:bool){self.edge_enabled.store(on,Ordering::SeqCst);self.hook.enabled.store(on&&self.ui.lock().unwrap().status=="connected",Ordering::SeqCst);if !on{input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.send(Message::ReturnControl);}self.update(|s|{s.edge_enabled=on;if !on{s.control="local".into();}});self.persist();}
     pub fn set_clipboard_enabled(&self,on:bool){self.clipboard_enabled.store(on,Ordering::SeqCst);self.update(|s|s.clipboard_enabled=on);self.persist();}
-    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.update(|s|{s.status="waiting".into();s.peer.clear();});}
+    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});}
     pub fn send(&self,m:Message){if let Some(tx)=self.out.lock().unwrap().as_ref(){let _=tx.send(m);}}
     pub fn start(self:&Arc<Self>){
         let c=self.clone();tauri::async_runtime::spawn(async move{if let Err(e)=server(c.clone()).await{c.update(|s|s.error=format!("本机监听启动失败：{e}"));}});
         let (tx,rx)=mpsc::channel();*self.capture.lock().unwrap()=Some(Arc::new(tx));
-        let c=self.clone();thread::spawn(move||while let Ok(ev)=rx.recv(){match ev{Captured::EnterRemote=>c.send(Message::Control{enabled:true}),Captured::ReturnLocal=>c.send(Message::ReturnControl),Captured::Event(event)=>c.send(Message::Input{event})}});
+        let c=self.clone();thread::spawn(move||while let Ok(ev)=rx.recv(){match ev{Captured::EnterRemote=>{c.update(|s|s.control="remote".into());c.send(Message::Control{enabled:true})},Captured::ReturnLocal=>{c.update(|s|s.control="local".into());c.send(Message::ReturnControl)},Captured::Event(event)=>c.send(Message::Input{event})}});
+        // Displays can be plugged in or rearranged while the app runs; the handoff edges follow.
+        let c=self.clone();thread::spawn(move||loop{let(x,y,w,h)=screen_rect();c.hook.set_screen(x,y,w,h);thread::sleep(Duration::from_secs(2));});
         self.spawn_hook();
         let c=self.clone();thread::spawn(move||{let mut previous=String::new();loop{if let Ok(mut clip)=arboard::Clipboard::new(){if c.clipboard_enabled.load(Ordering::Relaxed){if let Ok(text)=clip.get_text(){if text!=previous&&text!=*c.clipboard_echo.lock().unwrap(){previous=text.clone();c.send(Message::Clipboard{text});}}}}thread::sleep(Duration::from_millis(500));}});
     }
@@ -138,7 +140,15 @@ fn env_port(name:&str)->Option<u16>{std::env::var(name).ok().and_then(|v|v.parse
 fn listen_port()->u16{env_port(PORT_ENV).unwrap_or(DEFAULT_PORT)}
 fn peer_port()->u16{env_port(PEER_PORT_ENV).or_else(||env_port(PORT_ENV)).unwrap_or(DEFAULT_PORT)}
 fn initial_pin()->String{std::env::var(PIN_ENV).ok().filter(|v|valid_pin(v)).unwrap_or_else(make_pin)}
-fn screen_size()->(u32,u32){DisplayInfo::all().ok().and_then(|mut v|v.drain(..).find(|d|d.is_primary).or_else(||DisplayInfo::all().ok()?.into_iter().next()).map(|d|(d.width,d.height))).unwrap_or((1920,1080))}
+/// Union of display bounds `(x, y, right, bottom)`. A monitor left of or above the primary has a
+/// negative origin, and the handoff edges belong to the whole desktop rather than to one screen.
+fn union_rect(bounds:impl Iterator<Item=(i32,i32,i32,i32)>)->(i32,i32,u32,u32){
+    let (mut x0,mut y0,mut x1,mut y1)=(i32::MAX,i32::MAX,i32::MIN,i32::MIN);
+    for (x,y,r,b) in bounds { x0=x0.min(x); y0=y0.min(y); x1=x1.max(r); y1=y1.max(b); }
+    if x1<=x0||y1<=y0 { return (0,0,1920,1080); }
+    (x0,y0,(x1-x0) as u32,(y1-y0) as u32)
+}
+fn screen_rect()->(i32,i32,u32,u32){union_rect(DisplayInfo::all().unwrap_or_default().iter().map(|d|(d.x,d.y,d.x+d.width as i32,d.y+d.height as i32)))}
 
 pub fn settings_path(app:&AppHandle)->PathBuf{app.path().app_data_dir().unwrap_or_else(|_|std::env::temp_dir()).join("settings.json")}
 pub fn read_settings(path:&Path)->Option<Settings>{
@@ -180,15 +190,15 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
     core.hook.enabled.store(core.edge_enabled.load(Ordering::SeqCst),Ordering::SeqCst);
     core.update(|s|{s.status="connected".into();s.peer=peer;s.error.clear();});
     let k=key.clone();let writer=tauri::async_runtime::spawn(async move{while let Some(body)=rx.recv().await{let Ok(bytes)=serde_json::to_vec(&body)else{continue};let mut h=HmacSha256::new_from_slice(k.as_bytes()).unwrap();h.update(&bytes);let packet=Packet{mac:hex(&h.finalize().into_bytes()),body};if let Ok(text)=serde_json::to_string(&packet){if sink.send(WsMessage::Text(text.into())).await.is_err(){break;}}}});
-    let dims=screen_size();let mut cursor=(dims.0 as f64/2.0,dims.1 as f64/2.0);let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
+    let(x,y,w,h)=screen_rect();let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
     while let Some(Ok(frame))=stream.next().await{let WsMessage::Text(text)=frame else{continue};let Ok(packet)=serde_json::from_str::<Packet>(&text)else{continue};if !verify(&key,&packet){continue;}match packet.body{
-        Message::Input{event}=>{match &event{crate::protocol::InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},crate::protocol::InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}if let Err(e)=input::inject(&event,&mut cursor,(dims.0 as f64,dims.1 as f64),&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}},
-        Message::Control{enabled}=>core.hook.receiving.store(enabled,Ordering::SeqCst),
+        Message::Input{event}=>{match &event{crate::protocol::InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},crate::protocol::InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}},
+        Message::Control{enabled}=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
         Message::Disconnect=>break,
-        Message::ReturnControl=>{input::restore_pointer(&core.hook,cursor.0,cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);},
+        Message::ReturnControl=>{input::restore_pointer(&core.hook,inj.cursor.0,inj.cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);core.update(|s|s.control="local".into());},
         Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>{*core.clipboard_echo.lock().unwrap()=text.clone();let _=tauri::async_runtime::spawn_blocking(move||if let Ok(mut c)=arboard::Clipboard::new(){let _=c.set_text(text);}).await;},_=>{}
     }}
-    writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::restore_pointer(&core.hook,cursor.0,cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();});
+    writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::restore_pointer(&core.hook,inj.cursor.0,inj.cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});
 }
 fn verify(key:&str,p:&Packet)->bool{let Ok(bytes)=serde_json::to_vec(&p.body)else{return false};let Ok(mut h)=HmacSha256::new_from_slice(key.as_bytes())else{return false};h.update(&bytes);h.verify_slice(&unhex(&p.mac)).is_ok()}
 fn hex(bytes:&[u8])->String{bytes.iter().map(|b|format!("{b:02x}")).collect()}
@@ -310,9 +320,8 @@ mod tests {
     #[test]
     fn screen_geometry_feeds_the_handoff_edge_and_anchor() {
         let hook=HookState::new();
-        hook.set_screen(1920,1080);
-        assert_eq!(hook.edge().band(1920.0,1080.0),1918.0);
-        assert!(input::entry_crossed(1918.0,1918.0,false));
+        hook.set_screen(0,0,1920,1080);
+        assert!(input::entry_crossed(1918.0,0.0,1920.0,false));
         assert_eq!(hook.anchor(),(1559.0,540.0));
         hook.set_edge(Edge::Left);
         assert_eq!(hook.anchor(),(360.0,540.0));
@@ -321,11 +330,25 @@ mod tests {
         hook.set_edge(Edge::Top);
         assert_eq!(hook.anchor(),(960.0,360.0));
         hook.set_edge(Edge::Right);
-        hook.set_screen(800,600);
-        assert_eq!(hook.edge().band(800.0,600.0),798.0);
+        hook.set_screen(-1920,-400,3840,1480);
+        assert_eq!(hook.rect(),input::Rect{x:-1920.0,y:-400.0,w:3840.0,h:1480.0});
+        assert_eq!(hook.anchor(),(1559.0,340.0));
         assert_eq!(hook.edge().coord(10.0,20.0),10.0);
         hook.set_edge(Edge::Top);
         assert_eq!(hook.edge().coord(10.0,20.0),20.0);
+    }
+
+    #[test]
+    fn the_desktop_is_the_union_of_every_display() {
+        // One screen: the union is that screen.
+        assert_eq!(union_rect([(0,0,1920,1080)].into_iter()),(0,0,1920,1080));
+        // A second screen to the right extends the desktop instead of replacing it.
+        assert_eq!(union_rect([(0,0,1920,1080),(1920,0,3840,1080)].into_iter()),(0,0,3840,1080));
+        // A screen left of and above the primary keeps its negative origin.
+        assert_eq!(union_rect([(0,0,1920,1080),(-1440,-900,0,180)].into_iter()),(-1440,-900,3360,1980));
+        // Order must not matter, and a mirror of the primary must not shrink the desktop.
+        assert_eq!(union_rect([(-1440,-900,0,180),(0,0,1920,1080),(0,0,1920,1080)].into_iter()),(-1440,-900,3360,1980));
+        assert_eq!(union_rect([].into_iter()),(0,0,1920,1080),"no display info must still leave a usable desktop");
     }
 
     #[test]

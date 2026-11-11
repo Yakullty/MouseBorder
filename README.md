@@ -13,7 +13,8 @@
 | 设置持久化、断线重连 | 已验证逻辑 | `cargo test` 单元测试 |
 | macOS 打包体积 | 2.7 MiB / ZIP 1.5 MiB | `native/build-mac.sh` |
 | Windows 代码可编译 | 已验证（类型检查） | `cargo check --target x86_64-pc-windows-msvc` 通过 |
-| 键盘鼠标捕获与注入 | **未验证** | 需要重新授权 + 第二台机器 |
+| 接收端注入（移动/滚轮/坏 MAC 拒绝/还原） | 已验证（macOS 实机） | `native/tests/input_link.rs` 实机通过 |
+| 多屏并集几何、四侧交接、滚轮单位换算 | 已验证逻辑 | `cargo test` 单元测试 |
 | 边缘交接手感 | **未验证** | 需要双机实测 |
 
 macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIToolbox 的 `TISGetInputSourceProperty`，而该 API 断言必须在主队列执行，tap 回调跑在后台线程，第一次物理按键就会 `dispatch_assert_queue_fail` → SIGTRAP。现在由 [native/src/tap.rs](native/src/tap.rs) 自建 `CGEventTap`，只读标量字段，并直接取设备相对位移；注入仍走 `rdev::simulate`。
@@ -22,9 +23,11 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 
 - 手动 IPv4/IPv6 + 六位配对码，配对码可刷新。
 - TCP/WebSocket 端口 `39876`；配对后每条消息带 HMAC-SHA256，校验失败静默丢弃。
-- 全局输入钩子：越过右/左边缘把控制权交给对端，被控端光标顶到对应边缘或 `Ctrl+Alt+Esc` 交还。
+- 全局输入钩子：越过右/左/上/下任一侧边缘把控制权交给对端；被控端光标顶到**朝向对端的那条边**或 `Ctrl+Alt+Esc` 交还。界面顶部徽章实时显示「本机控制 / 正在控制对端 / 对端控制本机」。
 - 鼠标移动、按键、滚轮、常用键盘键注入；文本剪贴板 500ms 轮询同步。
-- 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题）。
+- 几何按**所有显示器的并集矩形**计算（副屏在主屏左/上方时原点为负），每 2s 跟随插拔与分辨率变化；接收端按整个虚拟桌面注入，Windows 侧减去并集原点后再交给 rdev 的 `VIRTUALDESK` 归一化。
+- 滚轮在线路上统一为 1/120 格（Windows `WHEEL_DELTA`）：macOS 的像素增量按每格约 10px 换算，注入时保留小数余数累加，触控板的细碎增量不会被逐条截断成 0。
+- 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题）；macOS 逐屏隐藏光标，副屏上不会留下可见的幽灵光标。
 - 断线自动重连（1→2→4→…10s 退避）；配对码错误等不可自愈的情况停止并提示。
 - 设置写入 `<appData>/settings.json`，重启后保留。
 
@@ -35,7 +38,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 ```sh
 cd native
 cargo tauri dev     # 调试运行
-cargo test          # 20 个单元测试
+cargo test          # 33 个单元测试
 ```
 
 ### 本机端到端自测（不需要第二台机器）
@@ -44,11 +47,14 @@ cargo test          # 20 个单元测试
 
 ```sh
 cd native
-MOUSEBORDER_PIN=246810 open ../MouseBorder.app
+MOUSEBORDER_PIN=246810 open --stderr /tmp/mouseborder.log ../MouseBorder.app
 MOUSEBORDER_TEST_PIN=246810 cargo test --test clipboard_link -- --ignored --nocapture
+MOUSEBORDER_TEST_PIN=246810 cargo test --test input_link -- --ignored --nocapture
 ```
 
-测试只验证链路与剪贴板。它会改写系统剪贴板并在结束时还原；若剪贴板当前不是 UTF-8 文本，测试直接失败退出而不做有损还原。运行前请保持设置里 `edge_enabled` 为 `false`（或删除 `<appData>/settings.json` 后再关掉开关），否则真实的鼠标接管会干扰你正在用的桌面。
+`clipboard_link` 验证握手、HMAC 与剪贴板；它会改写系统剪贴板并在结束时还原，若剪贴板当前不是 UTF-8 文本则直接失败退出而不做有损还原。`input_link` 验证接收端注入：配对后发 `control` + 若干 `move`，断言光标真的落到桌面中心偏移处，再发滚轮断言光标不被带着走，坏 MAC 的包必须被丢弃，最后还原光标位置。运行期间请**不要碰鼠标**（约 2s），物理移动会叠加进断言。
+
+两个测试都要求设置里 `edge_enabled` 为 `false`（或先删掉 `<appData>/settings.json` 再关掉开关），否则真实的边缘接管会吞掉你正在用的键鼠。
 
 环境变量覆盖：`MOUSEBORDER_PORT`（监听端口）、`MOUSEBORDER_PEER_PORT`（连接对端端口）、`MOUSEBORDER_PIN`（固定配对码）。前两个用于在同一台机器上跑两个实例。
 
@@ -69,6 +75,8 @@ native\build-windows.ps1
 ```
 
 产出 `MouseBorder-Windows-x64.exe`，不安装、不写注册表。脚本会检查 WebView2 Runtime 并打印放行 TCP `39876` 的防火墙命令（需管理员执行）。
+
+不想在本地装 VS Build Tools（约 2.5 GB）时，用仓库自带的云端构建：推送到 `main` 且改动涉及 `native/**`，或在 GitHub 仓库页 **Actions → Build Windows → Run workflow** 手动触发，跑完在该次运行的 **Artifacts** 里下载 `MouseBorder-Windows-x64`。工作流见 [.github/workflows/windows.yml](.github/workflows/windows.yml)，用的就是同一条 `cargo build --release --features tauri/custom-protocol`。
 
 ## 双机使用
 
@@ -107,4 +115,4 @@ Windows 由防火墙控制专用网络入站。
 
 ## 已知边界
 
-多显示器只取主屏；分辨率在链路建立时读取，中途改分辨率不会跟随；键盘布局与系统快捷键未做映射；未做心跳与超时探测；`Ctrl+Alt+Esc` 依赖本机仍能收到键盘事件；未签名/未公证，分发给别的 Mac 需要在“隐私与安全性”里手动放行。
+多显示器按并集矩形处理，非矩形摆放（例如副屏只占主屏上半段）时并集里的空隙不是可落点，光标会被系统夹到最近的屏幕；键盘布局与系统快捷键未做映射；未做心跳与超时探测；`Ctrl+Alt+Esc` 依赖本机仍能收到键盘事件；macOS 每格滚轮的像素数按 10px 估算，滚动幅度与本机手感可能有偏差；未签名/未公证，分发给别的 Mac 需要在“隐私与安全性”里手动放行。

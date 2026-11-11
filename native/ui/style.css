@@ -8,3 +8,5 @@
 .row .hook .badge{font-style:normal;min-width:70px;text-align:center}
 .row .hook .badge.on{color:#75dfb2;border-color:#245b47;background:#142a23}
 .row .hook .button.secondary{white-space:nowrap}
+.badges{display:flex;align-items:center;gap:8px}
+.badge.act{color:#aeb8ff;border-color:#3d4470;background:#1a1e33}
