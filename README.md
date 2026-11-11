@@ -12,7 +12,7 @@
 | 剪贴板双向同步（含回声抑制） | 已验证 | 同上 |
 | 设置持久化、断线重连 | 已验证逻辑 | `cargo test` 单元测试 |
 | macOS 打包体积 | 2.7 MiB / ZIP 1.5 MiB | `native/build-mac.sh` |
-| Windows 代码可编译 | 已验证（类型检查） | `cargo check --target x86_64-pc-windows-msvc` 通过 |
+| Windows 代码可编译 | 由 CI 验证 | GitHub Actions `windows-latest`；本机 `cargo check --target x86_64-pc-windows-msvc` 会在 `tauri-build` 处失败（缺 SDK 的 `llvm-rc`/`rc.exe`） |
 | 接收端注入（移动/滚轮/坏 MAC 拒绝/还原） | 已验证（macOS 实机） | `native/tests/input_link.rs` 实机通过 |
 | 多屏并集几何、四侧交接、滚轮单位换算 | 已验证逻辑 | `cargo test` 单元测试 |
 | 边缘交接手感 | **未验证** | 需要双机实测 |
@@ -25,7 +25,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 - TCP/WebSocket 端口 `39876`；配对后每条消息带 HMAC-SHA256，校验失败静默丢弃。
 - 全局输入钩子：越过右/左/上/下任一侧边缘把控制权交给对端；被控端光标顶到**朝向对端的那条边**或 `Ctrl+Alt+Esc` 交还。界面顶部徽章实时显示「本机控制 / 正在控制对端 / 对端控制本机」。
 - 鼠标移动、按键、滚轮、常用键盘键注入；文本剪贴板 500ms 轮询同步。
-- 几何按**所有显示器的并集矩形**计算（副屏在主屏左/上方时原点为负），每 2s 跟随插拔与分辨率变化；接收端按整个虚拟桌面注入，Windows 侧减去并集原点后再交给 rdev 的 `VIRTUALDESK` 归一化。
+- 几何按**所有显示器的并集矩形**计算（副屏在主屏左/上方时原点为负），每 2s 跟随插拔与分辨率变化。Windows 的绝对移动不走 rdev：它按 `GetSystemMetrics(SM_CXVIRTUALSCREEN)` 归一化，而该值受 DPI 虚拟化影响，缩放桌面上会与 `display_info` 的 DEVMODE 并集不一致；现在自己按同一个并集矩形换算成 0..65535 再 `SendInput`（`VIRTUALDESK`），光标回拉也走这条路径。
 - 滚轮在线路上统一为 1/120 格（Windows `WHEEL_DELTA`）：macOS 的像素增量按每格约 10px 换算，注入时保留小数余数累加，触控板的细碎增量不会被逐条截断成 0。
 - 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题）；macOS 逐屏隐藏光标，副屏上不会留下可见的幽灵光标。
 - 断线自动重连（1→2→4→…10s 退避）；配对码错误等不可自愈的情况停止并提示。
@@ -38,7 +38,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 ```sh
 cd native
 cargo tauri dev     # 调试运行
-cargo test          # 33 个单元测试
+cargo test          # 34 个单元测试
 ```
 
 ### 本机端到端自测（不需要第二台机器）

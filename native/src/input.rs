@@ -125,6 +125,15 @@ pub fn reanchor(x:f64, y:f64, r:Rect, edge:Edge)->Option<(f64,f64)>{
 /// on the hand-back edge and release control from there.
 pub fn clamp_move(current:f64, delta:f64, lo:f64, hi:f64)->f64{ if hi-lo<1.0 {lo} else {(current+delta).clamp(lo,hi-1.0)} }
 
+/// Maps a desktop coordinate onto SendInput's 0..65535 absolute range using the same union rect the
+/// handoff geometry uses. rdev divides by GetSystemMetrics(SM_CXVIRTUALSCREEN) instead, which is
+/// DPI-virtualised and disagrees with the DEVMODE union on a scaled Windows desktop.
+#[cfg_attr(not(target_os="windows"), allow(dead_code))]
+pub fn absolute_units(coord:f64, origin:f64, span:f64)->i32{
+    if span<1.0 {return 0;}
+    (((coord-origin)/(span-1.0))*65535.0).round().clamp(0.0,65535.0) as i32
+}
+
 /// Decides what happens to one captured event. `true` lets it reach the local machine, `false`
 /// swallows it. Both hook backends funnel into this so the handoff rules stay in one place.
 pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sender<Captured>) -> bool {
@@ -236,29 +245,32 @@ fn wheel_units(ticks:i64, carry:&mut f64)->i64{
     whole as i64
 }
 
+/// Marks the whole injection as ours so the hook ignores the resulting event, and keeps the flag up
+/// long enough for the event to come back through the hook.
+fn guarded<T>(state:&HookState, post:impl FnOnce()->T)->T{
+    state.injection.store(true,Ordering::SeqCst);
+    let out=post();
+    std::thread::sleep(Duration::from_millis(3));
+    state.injection.store(false,Ordering::SeqCst);
+    out
+}
+
 pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result<(),String>{
     let r=state.rect();
     let native=match event {
         InputEvent::Move{dx,dy}=>{
             inj.cursor.0=clamp_move(inj.cursor.0,*dx,r.x,r.hi(false));
             inj.cursor.1=clamp_move(inj.cursor.1,*dy,r.y,r.hi(true));
-            // rdev's Windows backend normalises over the virtual desktop, whose origin is the union's
-            // top-left corner; macOS posts global points as they are.
             #[cfg(target_os="windows")]
-            let (x,y)=(inj.cursor.0-r.x,inj.cursor.1-r.y);
+            return guarded(state,||platform_move(inj.cursor,r));
             #[cfg(not(target_os="windows"))]
-            let (x,y)=inj.cursor;
-            EventType::MouseMove{x,y}
+            EventType::MouseMove{x:inj.cursor.0,y:inj.cursor.1}
         },
         InputEvent::Button{button,down}=>{let b=match button{MouseButton::Left=>Button::Left,MouseButton::Right=>Button::Right,MouseButton::Middle=>Button::Middle};if *down{EventType::ButtonPress(b)}else{EventType::ButtonRelease(b)}},
         InputEvent::Wheel{dx,dy}=>EventType::Wheel{delta_x:wheel_units(*dx,&mut inj.wheel.0),delta_y:wheel_units(*dy,&mut inj.wheel.1)},
         InputEvent::Key{code,down}=>{let Some(k)=parse_key(code) else{return Ok(())};if *down{EventType::KeyPress(k)}else{EventType::KeyRelease(k)}},
     };
-    state.injection.store(true,Ordering::SeqCst);
-    let result=simulate(&native).map_err(|e|format!("input injection failed: {e:?}"));
-    std::thread::sleep(Duration::from_millis(3));
-    state.injection.store(false,Ordering::SeqCst);
-    result
+    guarded(state,||simulate(&native).map_err(|e|format!("input injection failed: {e:?}")))
 }
 
 /// Key names on the wire are rdev's own variant spellings; `parse_key` is the accepting half.
@@ -273,9 +285,9 @@ pub fn release_button(button:MouseButton)->Result<(),String>{let b=match button{
 
 fn hide_pointer(state:&HookState){if !state.cursor_hidden.swap(true,Ordering::SeqCst){platform_hide();}}
 pub fn restore_pointer(state:&HookState,x:f64,y:f64){if state.cursor_hidden.swap(false,Ordering::SeqCst){platform_show();let edge=state.edge();let r=state.rect();let v=edge.vertical();let inside=if edge.low(){r.lo(v)+3.0}else{r.hi(v)-3.0};let (rx,ry)=if v{(x.clamp(r.x,r.hi(false)-1.0),inside)}else{(inside,y.clamp(r.y,r.hi(true)-1.0))};warp_pointer(state,rx,ry);}}
-fn warp_pointer(state:&HookState,x:f64,y:f64){state.injection.store(true,Ordering::SeqCst);platform_warp(x,y);std::thread::sleep(Duration::from_millis(3));state.injection.store(false,Ordering::SeqCst);}
+fn warp_pointer(state:&HookState,x:f64,y:f64){guarded(state,||platform_warp(x,y,state.rect()));}
 #[cfg(target_os="macos")]
-fn platform_warp(x:f64,y:f64){#[repr(C)]struct Point{x:f64,y:f64}#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGWarpMouseCursorPosition(p:Point)->i32;}unsafe{let _=CGWarpMouseCursorPosition(Point{x,y});}}
+fn platform_warp(x:f64,y:f64,_r:Rect){#[repr(C)]struct Point{x:f64,y:f64}#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGWarpMouseCursorPosition(p:Point)->i32;}unsafe{let _=CGWarpMouseCursorPosition(Point{x,y});}}
 /// The cursor hide counter is per display: hiding only the main one leaves the ghost cursor visible
 /// on every other screen of a multi-monitor desktop.
 #[cfg(target_os="macos")]
@@ -285,13 +297,31 @@ fn platform_hide(){#[link(name="CoreGraphics",kind="framework")]unsafe extern "C
 #[cfg(target_os="macos")]
 fn platform_show(){#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGDisplayShowCursor(id:u32)->i32;}for id in display_ids(){unsafe{let _=CGDisplayShowCursor(id);}}}
 #[cfg(target_os="windows")]
-fn platform_warp(x:f64,y:f64){#[link(name="user32")]unsafe extern "system"{fn SetCursorPos(x:i32,y:i32)->i32;}unsafe{let _=SetCursorPos(x as i32,y as i32);}}
+fn platform_warp(x:f64,y:f64,r:Rect){let _=platform_move((x,y),r);}
+/// Only mouse input is ever posted, so the INPUT union can be spelled as its largest member.
+#[cfg(target_os="windows")]
+#[repr(C)]
+struct MouseInput{dx:i32,dy:i32,data:i32,flags:u32,time:u32,extra:usize}
+#[cfg(target_os="windows")]
+#[repr(C)]
+struct Input{kind:u32,mouse:MouseInput}
+#[cfg(target_os="windows")]
+fn platform_move(cursor:(f64,f64),r:Rect)->Result<(),String>{
+    #[link(name="user32")]unsafe extern "system"{fn SendInput(count:u32,inputs:*mut Input,size:i32)->u32;}
+    const MOVE_ABSOLUTE_VIRTUALDESK:u32=0x0001|0x8000|0x4000;
+    let mut input=Input{kind:0,mouse:MouseInput{
+        dx:absolute_units(cursor.0,r.x,r.w),
+        dy:absolute_units(cursor.1,r.y,r.h),
+        data:0,flags:MOVE_ABSOLUTE_VIRTUALDESK,time:0,extra:0}};
+    let sent=unsafe{SendInput(1,&mut input,std::mem::size_of::<Input>() as i32)};
+    if sent==1{Ok(())}else{Err("SendInput rejected the absolute move".into())}
+}
 #[cfg(target_os="windows")]
 fn platform_hide(){#[link(name="user32")]unsafe extern "system"{fn ShowCursor(show:i32)->i32;}unsafe{let _=ShowCursor(0);}}
 #[cfg(target_os="windows")]
 fn platform_show(){#[link(name="user32")]unsafe extern "system"{fn ShowCursor(show:i32)->i32;}unsafe{let _=ShowCursor(1);}}
 #[cfg(not(any(target_os="macos",target_os="windows")))]
-fn platform_warp(_:f64,_:f64){}
+fn platform_warp(_:f64,_:f64,_:Rect){}
 #[cfg(not(any(target_os="macos",target_os="windows")))]
 fn platform_hide(){}
 #[cfg(not(any(target_os="macos",target_os="windows")))]
@@ -441,6 +471,21 @@ mod tests {
         assert_eq!(clamp_move(-1440.0,-5000.0,DUAL.x,DUAL.hi(false)),-1440.0);
         assert_eq!(clamp_move(0.0,5000.0,DUAL.x,DUAL.hi(false)),1919.0);
         assert_eq!(clamp_move(0.0,-5000.0,DUAL.y,DUAL.hi(true)),-900.0);
+    }
+
+    #[test]
+    fn absolute_moves_span_the_union_rect_not_the_primary_display() {
+        assert_eq!(absolute_units(SCREEN.x,SCREEN.x,SCREEN.w),0);
+        assert_eq!(absolute_units(SCREEN.hi(false)-1.0,SCREEN.x,SCREEN.w),65535);
+        assert_eq!(absolute_units(DUAL.x,DUAL.x,DUAL.w),0);
+        assert_eq!(absolute_units(DUAL.hi(false)-1.0,DUAL.x,DUAL.w),65535);
+        assert_eq!(absolute_units(DUAL.y,DUAL.y,DUAL.h),0);
+        assert_eq!(absolute_units(DUAL.hi(true)-1.0,DUAL.y,DUAL.h),65535);
+        // A secondary display left of the primary one must still land inside the range.
+        assert!(absolute_units(-1440.0,DUAL.x,DUAL.w)<absolute_units(0.0,DUAL.x,DUAL.w));
+        assert_eq!(absolute_units(-99999.0,DUAL.x,DUAL.w),0);
+        assert_eq!(absolute_units(99999.0,DUAL.x,DUAL.w),65535);
+        assert_eq!(absolute_units(500.0,0.0,0.0),0);
     }
 
     #[test]
