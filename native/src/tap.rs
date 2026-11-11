@@ -38,14 +38,14 @@ const OTHER_DRAGGED: u32 = 27;
 const DISABLED_BY_TIMEOUT: u32 = 14;
 const DISABLED_BY_USER: u32 = 15;
 
-// CGEventField values.
-const FIELD_MOUSE_DELTA_X: u32 = 6;
-const FIELD_MOUSE_DELTA_Y: u32 = 7;
+// CGEventField values, per CGEventFields.h (mirrored by core-graphics' EventField).
+// 6/7 are InstantMouser/Subtype and read as zero for a plain mouse: using them silently forwards
+// (0,0) moves, which looks like a working handoff whose peer cursor never moves.
+const FIELD_MOUSE_DELTA_X: u32 = 4;
+const FIELD_MOUSE_DELTA_Y: u32 = 5;
 const FIELD_KEYCODE: u32 = 9;
-const FIELD_WHEEL_AXIS1: u32 = 11;
-const FIELD_WHEEL_AXIS2: u32 = 12;
-const FIELD_WHEEL_POINT_X: u32 = 15;
-const FIELD_WHEEL_POINT_Y: u32 = 14;
+const FIELD_WHEEL_POINT_Y: u32 = 96;
+const FIELD_WHEEL_POINT_X: u32 = 97;
 
 // CGEventFlags bits for the modifiers reported through flagsChanged.
 const FLAG_CAPS_LOCK: u64 = 0x0001_0000;
@@ -110,15 +110,10 @@ extern "C" fn on_event(_proxy: u32, event_type: u32, event: Ref, refcon: Ref) ->
         RIGHT_UP => input::Raw::Button { button: Button::Right, down: false },
         OTHER_DOWN => input::Raw::Button { button: Button::Middle, down: true },
         OTHER_UP => input::Raw::Button { button: Button::Middle, down: false },
-        SCROLL_WHEEL => {
-            let px = unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) };
-            let py = unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) };
-            if px == 0 && py == 0 {
-                input::Raw::Wheel { dx: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_AXIS2) }, dy: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_AXIS1) } }
-            } else {
-                input::Raw::Wheel { dx: px, dy: py }
-            }
-        }
+        SCROLL_WHEEL => input::Raw::Wheel {
+            dx: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) },
+            dy: unsafe { CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) },
+        },
         KEY_DOWN => input::Raw::Key { code: key_from_code(unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) }), down: true },
         KEY_UP => input::Raw::Key { code: key_from_code(unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) }), down: false },
         FLAGS_CHANGED => {

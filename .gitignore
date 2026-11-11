@@ -1,0 +1,5 @@
+native/target/
+native/gen/
+.DS_Store
+MouseBorder.app/
+*.zip

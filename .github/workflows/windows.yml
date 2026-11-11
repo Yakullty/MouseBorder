@@ -12,14 +12,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Build release binary
         working-directory: native
+        # custom-protocol embeds ui/ into the binary; without the Tauri CLI this feature must be on.
         run: cargo build --release --features tauri/custom-protocol
+
       - name: Stage portable exe
         run: |
           New-Item -ItemType Directory -Force build-output | Out-Null
           Copy-Item native/target/release/mouseborder-native.exe build-output/MouseBorder-Windows-x64.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: MouseBorder-Windows-x64
