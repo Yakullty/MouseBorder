@@ -1,14 +1,14 @@
-use crate::{input::{self, Captured, HookState}, protocol::Message};
+use crate::{input::{self, Captured, HookState}, protocol::{InputEvent, Message}};
 use display_info::DisplayInfo;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitStream, FutureExt, SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::HashSet, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}, mpsc, Arc, Mutex, RwLock}, thread, time::Duration};
+use std::{collections::{HashSet, VecDeque}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}, mpsc, Arc, Mutex, RwLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{net::TcpListener, sync::mpsc as tmpsc};
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message as WsMessage, WebSocketStream};
+use tokio_tungstenite::{accept_async, connect_async_with_config, tungstenite::Message as WsMessage, WebSocketStream};
 type HmacSha256 = Hmac<Sha256>;
 
 const DEFAULT_PORT: u16 = 39876;
@@ -162,7 +162,7 @@ pub fn write_settings(path:&Path,s:&Settings){
 }
 async fn server(core:Arc<Core>)->Result<(),String>{
     let listener=TcpListener::bind(("0.0.0.0",listen_port())).await.map_err(|e|e.to_string())?;
-    loop{let(stream,_)=listener.accept().await.map_err(|e|e.to_string())?;let c=core.clone();tauri::async_runtime::spawn(async move{
+    loop{let(stream,_)=listener.accept().await.map_err(|e|e.to_string())?;let _=stream.set_nodelay(true);let c=core.clone();tauri::async_runtime::spawn(async move{
         if c.ui.lock().unwrap().status!="waiting"{return;}
         let Ok(mut ws)=accept_async(stream).await else{return};let Some(Ok(WsMessage::Text(txt)))=ws.next().await else{return};
         let Ok(Message::Pair{pin,label})=serde_json::from_str(&txt) else{return};
@@ -173,7 +173,9 @@ async fn server(core:Arc<Core>)->Result<(),String>{
 }
 async fn connect_peer(core:Arc<Core>,target:&Target)->Result<(),String>{
     let addr=std::net::SocketAddr::new(target.host.parse().map_err(|_|"请输入有效的 IPv4/IPv6 地址")?,peer_port());
-    let(mut ws,_)=connect_async(format!("ws://{addr}")).await.map_err(|e|e.to_string())?;
+    // Nagle holds a small mouse frame until the peer acknowledges the previous one, which on a LAN
+    // is a 40-200 ms stall per burst and is felt as a stuttering pointer rather than as latency.
+    let(mut ws,_)=connect_async_with_config(format!("ws://{addr}"),None,true).await.map_err(|e|e.to_string())?;
     let pair=Message::Pair{pin:target.pin.clone(),label:core.ui.lock().unwrap().hostname.clone()};
     ws.send(WsMessage::Text(serde_json::to_string(&pair).unwrap().into())).await.map_err(|e|e.to_string())?;
     let Some(Ok(WsMessage::Text(reply)))=ws.next().await else{return Err("对端未返回配对结果".into())};
@@ -191,14 +193,54 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
     core.update(|s|{s.status="connected".into();s.peer=peer;s.error.clear();});
     let k=key.clone();let writer=tauri::async_runtime::spawn(async move{while let Some(body)=rx.recv().await{let Ok(bytes)=serde_json::to_vec(&body)else{continue};let mut h=HmacSha256::new_from_slice(k.as_bytes()).unwrap();h.update(&bytes);let packet=Packet{mac:hex(&h.finalize().into_bytes()),body};if let Ok(text)=serde_json::to_string(&packet){if sink.send(WsMessage::Text(text.into())).await.is_err(){break;}}}});
     let(x,y,w,h)=screen_rect();let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
-    while let Some(Ok(frame))=stream.next().await{let WsMessage::Text(text)=frame else{continue};let Ok(packet)=serde_json::from_str::<Packet>(&text)else{continue};if !verify(&key,&packet){continue;}match packet.body{
-        Message::Input{event}=>{match &event{crate::protocol::InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},crate::protocol::InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}},
+    let mut queued:VecDeque<Message>=VecDeque::new();
+    loop{
+        let body=match queued.pop_front(){Some(b)=>b,None=>match next_body(&mut stream,&key).await{Some(b)=>b,None=>break}};
+        match body{
+        Message::Input{event}=>{
+            let event=match event{
+                InputEvent::Move{dx,dy}=>{
+                    let mut burst=Vec::new();
+                    while let Some(Some(m))=next_body(&mut stream,&key).now_or_never(){burst.push(m);}
+                    let(total,left)=coalesce_moves((dx,dy),burst);
+                    for m in left.into_iter().rev(){queued.push_front(m);}
+                    InputEvent::Move{dx:total.0,dy:total.1}
+                }
+                other=>other,
+            };
+            match &event{InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}
+            if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}
+        },
         Message::Control{enabled}=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
         Message::Disconnect=>break,
         Message::ReturnControl=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
-        Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>{*core.clipboard_echo.lock().unwrap()=text.clone();let _=tauri::async_runtime::spawn_blocking(move||if let Ok(mut c)=arboard::Clipboard::new(){let _=c.set_text(text);}).await;},_=>{}
+        // Awaiting the clipboard thread here would stall every input frame queued behind it.
+        Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>{*core.clipboard_echo.lock().unwrap()=text.clone();let _=tauri::async_runtime::spawn_blocking(move||if let Ok(mut c)=arboard::Clipboard::new(){let _=c.set_text(text);});},_=>{}
     }}
     writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::force_return(&core.hook);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});
+}
+/// Next verified body, or `None` once the link ends. Non-text frames and failed MACs are skipped.
+async fn next_body<S>(stream:&mut SplitStream<WebSocketStream<S>>,key:&str)->Option<Message>
+where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
+    loop{
+        let WsMessage::Text(text)=stream.next().await?.ok()? else{continue};
+        let Ok(packet)=serde_json::from_str::<Packet>(&text) else{continue};
+        if verify(key,&packet){return Some(packet.body)}
+    }
+}
+/// Folds the moves that arrived in one burst into a single injection. Every SendInput re-enters
+/// this process's own low-level hook, so applying a backlog frame by frame costs a hook round-trip
+/// and a visible cursor jump per frame instead of one smooth step. Anything that is not a move is
+/// handed back untouched, in order.
+fn coalesce_moves(mut total:(f64,f64),burst:Vec<Message>)->((f64,f64),Vec<Message>){
+    let mut left=Vec::new();
+    for m in burst{
+        match m{
+            Message::Input{event:InputEvent::Move{dx,dy}} if left.is_empty()=>{total.0+=dx;total.1+=dy;}
+            other=>left.push(other),
+        }
+    }
+    (total,left)
 }
 fn verify(key:&str,p:&Packet)->bool{let Ok(bytes)=serde_json::to_vec(&p.body)else{return false};let Ok(mut h)=HmacSha256::new_from_slice(key.as_bytes())else{return false};h.update(&bytes);h.verify_slice(&unhex(&p.mac)).is_ok()}
 fn hex(bytes:&[u8])->String{bytes.iter().map(|b|format!("{b:02x}")).collect()}
@@ -238,6 +280,42 @@ mod tests {
         let mut truncated=good.clone();truncated.mac.truncate(63);
         assert!(!verify(&key,&truncated));
         assert!(!verify("b".repeat(64).as_str(),&good),"another session key must not verify");
+    }
+
+    #[test]
+    fn a_burst_of_moves_becomes_one_injection_and_keeps_later_messages_in_order() {
+        let move_by=|dx:f64,dy:f64|Message::Input{event:InputEvent::Move{dx,dy}};
+        let (total,left)=coalesce_moves((1.0,2.0),vec![move_by(3.0,4.0),move_by(-1.0,0.5)]);
+        assert_eq!(total,(3.0,6.5));
+        assert!(left.is_empty());
+        let control=Message::Control{enabled:true};
+        let (total,left)=coalesce_moves((1.0,1.0),vec![move_by(2.0,2.0),control.clone(),move_by(9.0,9.0)]);
+        assert_eq!(total,(3.0,3.0),"only the moves before the first non-move may fold");
+        assert_eq!(left,vec![control,move_by(9.0,9.0)],"nothing after a non-move may be dropped");
+        assert_eq!(coalesce_moves((5.0,-5.0),vec![]),((5.0,-5.0),vec![]));
+    }
+
+    #[tokio::test]
+    async fn the_receive_path_skips_unverified_frames_and_ends_with_the_link() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        async fn send_body<S>(peer:&mut WebSocketStream<S>,key:&str,m:Message)
+        where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
+            peer.send(WsMessage::Text(serde_json::to_string(&packet(key,m)).unwrap().into())).await.unwrap();
+        }
+        let key="a".repeat(64);
+        let (peer_side,our_side)=tokio::io::duplex(8192);
+        let mut peer=WebSocketStream::from_raw_socket(peer_side,Role::Server,None).await;
+        let ours=WebSocketStream::from_raw_socket(our_side,Role::Client,None).await;
+        let (_sink,mut stream)=ours.split();
+        send_body(&mut peer,&key,Message::Input{event:InputEvent::Move{dx:1.0,dy:2.0}}).await;
+        peer.send(WsMessage::Binary(vec![1,2,3].into())).await.unwrap();
+        let forged=Packet{mac:hex(b"deadbeef"),body:Message::Input{event:InputEvent::Move{dx:999.0,dy:999.0}}};
+        peer.send(WsMessage::Text(serde_json::to_string(&forged).unwrap().into())).await.unwrap();
+        send_body(&mut peer,&key,Message::Clipboard{text:"after the forged frame".into()}).await;
+        assert_eq!(next_body(&mut stream,&key).await,Some(Message::Input{event:InputEvent::Move{dx:1.0,dy:2.0}}));
+        assert_eq!(next_body(&mut stream,&key).await,Some(Message::Clipboard{text:"after the forged frame".into()}));
+        drop(peer);
+        assert_eq!(next_body(&mut stream,&key).await,None,"a closed link must end the receive loop");
     }
 
     #[test]
