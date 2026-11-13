@@ -9,7 +9,7 @@
 | 项目 | 状态 | 依据 |
 | --- | --- | --- |
 | 握手配对、会话密钥、HMAC 封包与篡改拒绝 | 已验证 | `native/tests/clipboard_link.rs` 实机通过 |
-| 剪贴板双向同步（文字/图片/截图/文件，含回声抑制） | 文字已实机验证；图片/文件已验证逻辑 | `cargo test`：PNG 往返、分块重组、文件名越界拒绝、大小上限、二进制帧鉴权 |
+| 剪贴板双向同步（文字/图片/截图/文件，含回声抑制） | 文字已实机验证；图片/文件接收写入已修复并单测验证，双机粘贴待复测 | `cargo test`：PNG 往返、分块重组、文件名越界拒绝、大小上限、二进制帧鉴权、Mac 写图回读 TIFF、Windows CF_HDROP 布局 |
 | 设置持久化、断线重连 | 已验证逻辑 | `cargo test` 单元测试 |
 | 任一方点断开即彻底断开（不再自动重连） | 已验证逻辑 | `cargo test`：对端断开结束重试环、且不覆盖更新的连接 |
 | 记住已配对设备、免配对码直连 | 已验证逻辑 | `cargo test`：令牌记忆/更新/忘记即吊销 |
@@ -54,7 +54,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 ```sh
 cd native
 cargo tauri dev     # 调试运行
-cargo test          # 64 个单元测试
+cargo test          # 69 个单元测试
 ```
 
 ### 本机端到端自测（不需要第二台机器）
@@ -72,7 +72,7 @@ MOUSEBORDER_TEST_PIN=246810 cargo test --test input_link -- --ignored --nocaptur
 
 两个测试都要求设置里 `edge_enabled` 为 `false`（或先删掉 `<appData>/settings.json` 再关掉开关），否则真实的边缘接管会吞掉你正在用的键鼠。
 
-环境变量覆盖：`MOUSEBORDER_PORT`（监听端口）、`MOUSEBORDER_PEER_PORT`（连接对端端口）、`MOUSEBORDER_PIN`（固定配对码）。前两个用于在同一台机器上跑两个实例。
+环境变量覆盖：`MOUSEBORDER_PORT`（监听端口）、`MOUSEBORDER_PEER_PORT`（连接对端端口）、`MOUSEBORDER_PIN`（固定配对码）。前两个用于在同一台机器上跑两个实例。`MOUSEBORDER_TRACE=1` 打开剪贴板收发追踪日志（配合 `open --stderr /tmp/mouseborder.log` 捕获），用于定位「已接收但粘贴出旧内容」这类写入失败。
 
 ## 打包
 

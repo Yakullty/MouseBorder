@@ -1,6 +1,6 @@
 [package]
 name = "mouseborder-native"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 
 [dependencies]
@@ -17,6 +17,16 @@ sha2 = "0.10"
 rand = "0.8"
 rdev = { version = "0.5.3", features = ["unstable_grab"] }
 display-info = "0.5"
+
+# Direct clipboard writes for the two paths arboard gets wrong (macOS image via CGImageCreate,
+# Windows file-list without emptying). Versions match arboard's so no duplicate crates are built.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = "5"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

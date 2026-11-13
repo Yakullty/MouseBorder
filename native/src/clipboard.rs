@@ -14,6 +14,12 @@ pub const MAX_TRANSFER: u64 = 64 * 1024 * 1024;
 
 pub enum Payload { Text(String), Image(Vec<u8>), Files(Vec<PathBuf>) }
 
+impl Payload {
+    pub fn kind(&self) -> &'static str {
+        match self { Payload::Text(_) => "text", Payload::Image(_) => "image", Payload::Files(_) => "files" }
+    }
+}
+
 fn hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
@@ -63,11 +69,132 @@ pub fn signature(payload: &Payload) -> String {
 pub fn write(clip: &mut Clipboard, payload: &Payload) -> Result<(), String> {
     match payload {
         Payload::Text(t) => clip.set_text(t.clone()).map_err(|e| e.to_string()),
-        Payload::Image(png) => {
-            let img = decode_png(png).ok_or("图片解码失败")?;
-            clip.set_image(img).map_err(|e| e.to_string())
+        Payload::Image(png) => write_image(clip, png),
+        Payload::Files(paths) => write_files(clip, paths),
+    }
+}
+
+/// arboard's macOS image setter builds a CGImage, which can fail and return before the old
+/// clipboard is cleared, so a paste yields the previous content. Writing the PNG as an NSImage
+/// avoids that path. Other platforms keep arboard's setter, which works there.
+fn write_image(clip: &mut Clipboard, png: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = clip;
+        macos::write_image(png)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let img = decode_png(png).ok_or("图片解码失败")?;
+        clip.set_image(img).map_err(|e| e.to_string())
+    }
+}
+
+/// arboard's Windows file-list setter never empties the clipboard, so stale formats survive and a
+/// paste can return the previous content. Write CF_HDROP ourselves in one empty-then-set session.
+fn write_files(clip: &mut Clipboard, paths: &[PathBuf]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = clip;
+        windows::write_files(paths)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        clip.set().file_list(paths).map_err(|e| e.to_string())
+    }
+}
+
+/// CF_HDROP blob: a 20-byte DROPFILES header (wide-char flag set) then each null-terminated UTF-16
+/// path and a final extra null. Plain bytes so the layout is unit-testable on any platform.
+#[cfg(any(target_os = "windows", test))]
+fn hdrop_bytes(paths: &[Vec<u16>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&20u32.to_le_bytes()); // pFiles: offset of the file list
+    out.extend_from_slice(&0i32.to_le_bytes());  // pt.x
+    out.extend_from_slice(&0i32.to_le_bytes());  // pt.y
+    out.extend_from_slice(&0i32.to_le_bytes());  // fNC
+    out.extend_from_slice(&1i32.to_le_bytes());  // fWide: paths are UTF-16
+    for w in paths {
+        for u in w { out.extend_from_slice(&u.to_le_bytes()); }
+    }
+    out.extend_from_slice(&0u16.to_le_bytes()); // list terminator (double null)
+    out
+}
+
+/// canonicalize() on Windows yields a `\\?\` verbatim path; Explorer pastes the plain form.
+#[cfg(any(target_os = "windows", test))]
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") { format!(r"\\{rest}") }
+    else if let Some(rest) = s.strip_prefix(r"\\?\") { rest.to_string() }
+    else { s.to_string() }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::{runtime::ProtocolObject, AllocAnyThread};
+    use objc2_app_kit::{NSImage, NSPasteboard};
+    use objc2_foundation::{NSArray, NSData};
+
+    pub fn write_image(png: &[u8]) -> Result<(), String> {
+        write_image_to(&NSPasteboard::generalPasteboard(), png)
+    }
+
+    pub(super) fn write_image_to(pasteboard: &NSPasteboard, png: &[u8]) -> Result<(), String> {
+        let data = NSData::with_bytes(png);
+        let image = NSImage::initWithData(NSImage::alloc(), &data)
+            .ok_or("NSImage 无法解码该图片")?;
+        let objects = NSArray::from_retained_slice(&[ProtocolObject::from_retained(image)]);
+        pasteboard.clearContents();
+        let ok = pasteboard.writeObjects(&objects);
+        if ok { Ok(()) } else { Err("写入图片到剪贴板失败（writeObjects 返回 NO）".into()) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use image::GenericImageView;
+        use objc2_app_kit::NSPasteboardTypeTIFF;
+        use objc2_foundation::NSString;
+
+        /// Uses a named pasteboard so the user's real clipboard is never touched. Proves the NSImage
+        /// write yields a TIFF that decodes back to the same image (arboard reads TIFF on macOS).
+        #[test]
+        fn writing_a_png_yields_a_tiff_that_decodes_back_to_the_image() {
+            let pb = NSPasteboard::pasteboardWithName(&NSString::from_str("MouseBorderSelfTest"));
+            let img = arboard::ImageData { width: 2, height: 2, bytes: std::borrow::Cow::Owned(vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]) };
+            let png = crate::clipboard::encode_png(&img).expect("encode");
+            write_image_to(&pb, &png).expect("write image");
+            let tiff = unsafe { pb.dataForType(NSPasteboardTypeTIFF) }
+                .expect("TIFF must be present so arboard and apps can read the image back");
+            let decoded = image::load_from_memory(&tiff.to_vec()).expect("the written TIFF must decode");
+            assert_eq!(decoded.dimensions(), (2, 2), "the pasted image must keep its size");
         }
-        Payload::Files(paths) => clip.set().file_list(paths).map_err(|e| e.to_string()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::path::{Path, PathBuf};
+
+    pub fn write_files(paths: &[PathBuf]) -> Result<(), String> {
+        let mut wide = Vec::new();
+        for p in paths {
+            if let Some(w) = hdrop_path(p) { wide.push(w); }
+        }
+        if wide.is_empty() { return Err("没有可写入的文件路径".into()); }
+        let bytes = super::hdrop_bytes(&wide);
+        let _clip = clipboard_win::Clipboard::new_attempts(5).map_err(|e| format!("打开剪贴板失败：{e}"))?;
+        clipboard_win::raw::set(clipboard_win::formats::CF_HDROP, &bytes)
+            .map_err(|e| format!("写入文件列表失败：{e}"))
+    }
+
+    fn hdrop_path(p: &Path) -> Option<Vec<u16>> {
+        let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = super::strip_verbatim(resolved.to_str()?);
+        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        wide.push(0);
+        Some(wide)
     }
 }
 
@@ -290,5 +417,62 @@ mod tests {
         let back = decode_png(&png).expect("decode");
         assert_eq!((back.width, back.height), (2, 2));
         assert_eq!(back.bytes.as_ref(), img.bytes.as_ref());
+    }
+
+    #[test]
+    fn the_hdrop_blob_has_a_wide_dropfiles_header_and_double_null_terminator() {
+        let path: Vec<u16> = "C:\\a.txt".encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = hdrop_bytes(&[path]);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 20, "pFiles must point just past the header");
+        assert_eq!(i32::from_le_bytes(bytes[16..20].try_into().unwrap()), 1, "fWide must mark UTF-16 paths");
+        assert_eq!(bytes.len(), 20 + 8 * 2 + 2 * 2, "header + 8 path chars + path null + terminator null");
+        assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0], "the list must end with two null wide chars");
+    }
+
+    #[test]
+    fn verbatim_windows_paths_are_reduced_to_the_form_explorer_pastes() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\a.txt"), r"C:\Users\a.txt");
+        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\a.txt"), r"\\server\share\a.txt");
+        assert_eq!(strip_verbatim(r"C:\plain\a.txt"), r"C:\plain\a.txt");
+    }
+
+    /// Restores the user's clipboard even if an assertion panics mid-test.
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) { if let Ok(mut c) = Clipboard::new() { let _ = c.set_text(self.0.clone()); } }
+    }
+
+    /// Live check that this OS can actually write a file list / image to the clipboard and read it
+    /// back pastable. Ignored by default because it touches the real clipboard; it refuses to run
+    /// unless the clipboard holds plain text so the restore is lossless.
+    #[test]
+    #[ignore = "mutates the real clipboard; backs up and restores plain text"]
+    fn the_live_clipboard_round_trips_files_and_images() {
+        let mut clip = Clipboard::new().expect("clipboard");
+        let backup = match clip.get_text() {
+            Ok(t) => t,
+            Err(_) => { eprintln!("clipboard is not plain text; skipping to avoid a lossy restore"); return; }
+        };
+        let _guard = Restore(backup);
+        let dir = tmp("live-clip");
+        let path = dir.join("hello.txt");
+        fs::write(&path, b"hello clipboard").unwrap();
+
+        write(&mut clip, &Payload::Files(vec![path.clone()])).expect("write file list");
+        let file_read = read(&mut clip);
+        let img = ImageData { width: 2, height: 2, bytes: std::borrow::Cow::Owned(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]) };
+        let png = encode_png(&img).expect("encode");
+        write(&mut clip, &Payload::Image(png)).expect("write image");
+        let image_read = read(&mut clip);
+        let _ = fs::remove_dir_all(&dir);
+
+        let (_, fp) = file_read.expect("read back the file list");
+        match fp {
+            Payload::Files(list) => assert!(list.iter().any(|p| p.canonicalize().ok() == path.canonicalize().ok()), "the pasted file must be the one we wrote: {list:?}"),
+            _ => panic!("expected a file list back from the clipboard"),
+        }
+        let (_, ip) = image_read.expect("read back the image");
+        assert!(matches!(ip, Payload::Image(_)), "expected an image back from the clipboard");
     }
 }

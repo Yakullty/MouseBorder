@@ -2142,13 +2142,17 @@ dependencies = [
 
 [[package]]
 name = "mouseborder-native"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "arboard",
+ "clipboard-win",
  "display-info",
  "futures-util",
  "hmac",
  "image",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rand 0.8.8",
  "rdev",
  "serde",

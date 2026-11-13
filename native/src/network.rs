@@ -135,6 +135,7 @@ impl Core {
         }});
     }
     fn send_payload(&self,payload:&clipboard::Payload){
+        trace(&format!("send[{}]",payload.kind()));
         match payload{
             clipboard::Payload::Text(text)=>self.send(Message::Clipboard{text:text.clone()}),
             clipboard::Payload::Image(png)=>{
@@ -157,14 +158,23 @@ impl Core {
         }
     }
     /// Writes a received payload and records what the clipboard actually holds afterwards, so the
-    /// poller sees our own write as an echo instead of a fresh copy to send back.
+    /// poller sees our own write as an echo instead of a fresh copy to send back. A failed write is
+    /// surfaced, not swallowed: "已接收" only means the bytes reassembled, not that the paste works.
     fn receive_payload(self:&Arc<Self>,payload:clipboard::Payload){
         let c=self.clone();
         let _=tauri::async_runtime::spawn_blocking(move||{
-            let Ok(mut clip)=arboard::Clipboard::new() else {return};
+            let kind=payload.kind();
+            let mut clip=match arboard::Clipboard::new(){
+                Ok(c)=>c,
+                Err(e)=>{trace(&format!("receive[{kind}] 打开剪贴板失败：{e}"));c.update(|s|{s.notice.clear();s.error=format!("打开剪贴板失败：{e}");});return;}
+            };
             *c.clipboard_echo.lock().unwrap()=clipboard::signature(&payload);
-            if clipboard::write(&mut clip,&payload).is_ok(){
-                if let Some((sig,_))=clipboard::read(&mut clip){*c.clipboard_echo.lock().unwrap()=sig;}
+            match clipboard::write(&mut clip,&payload){
+                Ok(())=>{
+                    if let Some((sig,_))=clipboard::read(&mut clip){*c.clipboard_echo.lock().unwrap()=sig.clone();trace(&format!("receive[{kind}] 写入成功，回读={sig}"));}
+                    else{trace(&format!("receive[{kind}] 写入成功，但回读为空"));}
+                }
+                Err(e)=>{trace(&format!("receive[{kind}] 写入剪贴板失败：{e}"));c.update(|s|{s.notice.clear();s.error=format!("写入剪贴板失败：{e}");});}
             }
         });
     }
@@ -230,6 +240,8 @@ fn stale(core:&Arc<Core>,gen:usize,target:&Target)->bool{core.link.load(Ordering
 fn fatal_pairing(e:&str)->bool{e.contains("配对码")||e.contains("响应")||e.contains("会话密钥")}
 
 fn make_pin()->String{format!("{:06}",thread_rng().gen_range(0..1_000_000))}
+/// Opt-in clipboard-path tracing: run with MOUSEBORDER_TRACE=1 and stderr captured to a file.
+fn trace(msg:&str){if std::env::var_os("MOUSEBORDER_TRACE").is_some(){eprintln!("[mouseborder] {msg}");}}
 fn valid_pin(p:&str)->bool{p.len()==6&&p.bytes().all(|b|b.is_ascii_digit())}
 fn make_key()->String{let mut b=[0u8;32];thread_rng().fill_bytes(&mut b);hex(&b)}
 fn env_port(name:&str)->Option<u16>{std::env::var(name).ok().and_then(|v|v.parse().ok())}
@@ -335,11 +347,13 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
         // Awaiting the clipboard thread here would stall every input frame queued behind it.
         Frame::Body(Message::Clipboard{text}) if core.clipboard_enabled.load(Ordering::Relaxed)=>core.receive_payload(clipboard::Payload::Text(text)),
         Frame::Body(Message::ClipboardImage{transfer,size}) if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+            trace(&format!("announce image transfer={transfer} size={size}"));
             if size>clipboard::MAX_TRANSFER{core.update(|s|s.error="图片超过大小上限".into());}
             else{image=Some((transfer,size,Vec::new()));core.update(|s|s.notice="正在接收图片…".into());}
         },
         Frame::Body(Message::ClipboardFiles{transfer,files}) if core.clipboard_enabled.load(Ordering::Relaxed)=>{
             let count=files.len();
+            trace(&format!("announce files transfer={transfer} count={count}"));
             match clipboard::Incoming::new(transfer,files,received_dir(&core,transfer)){
                 Ok(inc)=>{incoming=Some(inc);core.update(|s|s.notice=format!("正在接收 {count} 个文件…"));},
                 Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
@@ -356,7 +370,7 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
                     Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
                 }
             }else if kind==CHUNK_IMAGE{
-                let Some((t,size,buf))=image.as_mut().filter(|(t,_,_)|*t==transfer) else {continue};
+                let Some((_t,size,buf))=image.as_mut().filter(|(t,_,_)|*t==transfer) else {continue};
                 if buf.len()+data.len()>*size as usize{image=None;core.update(|s|s.error="图片分块超出声明大小".into());continue;}
                 buf.extend_from_slice(&data);
                 if buf.len()==*size as usize{let bytes=std::mem::take(buf);image=None;
@@ -502,6 +516,88 @@ mod tests {
         assert_eq!(verify_chunk(&key,&short),None,"a truncated header must be rejected");
         let mut tampered=bin.clone();tampered[35]^=1;
         assert_eq!(verify_chunk(&key,&tampered),None,"a flipped payload byte must fail the MAC");
+    }
+
+    /// Mirrors `install`'s writer byte-for-byte so these tests exercise the real wire contract:
+    /// signed JSON text for announcements, signed binary frames for bulk bytes.
+    async fn write_frame<S>(peer:&mut WebSocketStream<S>,key:&str,frame:Frame)
+    where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
+        match frame{
+            Frame::Body(body)=>{let bytes=serde_json::to_vec(&body).unwrap();let packet=Packet{mac:hex(&mac_bytes(key,&bytes)),body};peer.send(WsMessage::Text(serde_json::to_string(&packet).unwrap().into())).await.unwrap();}
+            Frame::Chunk{kind,transfer,data}=>{let payload=chunk_payload(kind,transfer,&data);let mut bin=mac_bytes(key,&payload);bin.extend_from_slice(&payload);peer.send(WsMessage::Binary(bin.into())).await.unwrap();}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_file_transfer_survives_the_wire_and_reassembles() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use crate::protocol::FileEntry;
+        let key="a".repeat(64);
+        let (peer_side,our_side)=tokio::io::duplex(1<<16);
+        let mut peer=WebSocketStream::from_raw_socket(peer_side,Role::Server,None).await;
+        let ours=WebSocketStream::from_raw_socket(our_side,Role::Client,None).await;
+        let (_sink,mut stream)=ours.split();
+        let dir=std::env::temp_dir().join(format!("mouseborder-wire-file-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&dir);
+        let transfer=7u64;
+        let a:Vec<u8>=(0..(clipboard::CHUNK+5)).map(|i|(i%251)as u8).collect();
+        let b=b"second file".to_vec();
+        let files=vec![FileEntry{name:"a.bin".into(),size:a.len()as u64},FileEntry{name:"b.txt".into(),size:b.len()as u64}];
+        // Send concurrently with receiving, like the real writer task: a 256 KiB chunk is bigger
+        // than the duplex buffer, so sending everything before reading would deadlock.
+        let (sk,sa,sb,sf)=(key.clone(),a.clone(),b.clone(),files.clone());
+        let sender=tokio::spawn(async move{
+            write_frame(&mut peer,&sk,Frame::Body(Message::ClipboardFiles{transfer,files:sf})).await;
+            write_frame(&mut peer,&sk,Frame::Chunk{kind:CHUNK_FILE,transfer,data:sa[..clipboard::CHUNK].to_vec()}).await;
+            write_frame(&mut peer,&sk,Frame::Chunk{kind:CHUNK_FILE,transfer,data:sa[clipboard::CHUNK..].to_vec()}).await;
+            write_frame(&mut peer,&sk,Frame::Chunk{kind:CHUNK_FILE,transfer,data:sb}).await;
+        });
+        let ann=next_body(&mut stream,&key).await.unwrap();
+        let Frame::Body(Message::ClipboardFiles{transfer:t,files})=ann else {panic!("expected a file announcement, got {ann:?}")};
+        assert_eq!(t,transfer);
+        let mut inc=clipboard::Incoming::new(t,files,dir.clone()).unwrap();
+        for _ in 0..3{
+            let f=next_body(&mut stream,&key).await.unwrap();
+            let Frame::Chunk{kind,transfer:t,data}=f else {panic!("expected a file chunk, got {f:?}")};
+            assert_eq!((kind,t),(CHUNK_FILE,transfer));
+            inc.chunk(&data).unwrap();
+        }
+        assert!(inc.complete());
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(),a,"a file spanning two chunks must reassemble");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(),b);
+        sender.await.unwrap();
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_full_image_transfer_survives_the_wire_and_reassembles() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let key="a".repeat(64);
+        let (peer_side,our_side)=tokio::io::duplex(1<<16);
+        let mut peer=WebSocketStream::from_raw_socket(peer_side,Role::Server,None).await;
+        let ours=WebSocketStream::from_raw_socket(our_side,Role::Client,None).await;
+        let (_sink,mut stream)=ours.split();
+        let transfer=9u64;
+        let png:Vec<u8>=(0..(clipboard::CHUNK+11)).map(|i|(i%253)as u8).collect();
+        let (sk,sp)=(key.clone(),png.clone());
+        let sender=tokio::spawn(async move{
+            write_frame(&mut peer,&sk,Frame::Body(Message::ClipboardImage{transfer,size:sp.len()as u64})).await;
+            write_frame(&mut peer,&sk,Frame::Chunk{kind:CHUNK_IMAGE,transfer,data:sp[..clipboard::CHUNK].to_vec()}).await;
+            write_frame(&mut peer,&sk,Frame::Chunk{kind:CHUNK_IMAGE,transfer,data:sp[clipboard::CHUNK..].to_vec()}).await;
+        });
+        let ann=next_body(&mut stream,&key).await.unwrap();
+        let Frame::Body(Message::ClipboardImage{transfer:t,size})=ann else {panic!("expected an image announcement, got {ann:?}")};
+        assert_eq!((t,size),(transfer,png.len()as u64));
+        let mut buf=Vec::new();
+        for _ in 0..2{
+            let f=next_body(&mut stream,&key).await.unwrap();
+            let Frame::Chunk{kind,transfer:t,data}=f else {panic!("expected an image chunk, got {f:?}")};
+            assert_eq!((kind,t),(CHUNK_IMAGE,transfer));
+            buf.extend_from_slice(&data);
+        }
+        assert_eq!(buf.len(),size as usize,"the receiver must stop exactly at the declared size");
+        assert_eq!(buf,png);
+        sender.await.unwrap();
     }
 
     #[test]
