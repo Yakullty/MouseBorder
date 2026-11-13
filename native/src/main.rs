@@ -2,6 +2,7 @@
 
 use tauri::Manager;
 
+mod clipboard;
 mod input;
 mod network;
 mod protocol;
@@ -14,6 +15,10 @@ fn get_state(state: tauri::State<'_, std::sync::Arc<network::Core>>) -> network:
 fn refresh_pin(state: tauri::State<'_, std::sync::Arc<network::Core>>) -> String { state.refresh_pin() }
 #[tauri::command]
 fn connect_peer(state: tauri::State<'_, std::sync::Arc<network::Core>>, host:String, pin:String) { state.connect(host,pin); }
+#[tauri::command]
+fn connect_device(state: tauri::State<'_, std::sync::Arc<network::Core>>, host:String) { state.connect_device(host); }
+#[tauri::command]
+fn forget_device(state: tauri::State<'_, std::sync::Arc<network::Core>>, host:String) { state.forget_device(host); }
 #[tauri::command]
 fn disconnect(state: tauri::State<'_, std::sync::Arc<network::Core>>) { state.disconnect(); }
 #[tauri::command]
@@ -72,7 +77,7 @@ fn main() {
         }
         Ok(())
     })
-  .invoke_handler(tauri::generate_handler![get_state,refresh_pin,connect_peer,set_edge,set_enabled,set_clipboard,disconnect,retry_hook])
+  .invoke_handler(tauri::generate_handler![get_state,refresh_pin,connect_peer,connect_device,forget_device,set_edge,set_enabled,set_clipboard,disconnect,retry_hook])
   .build(tauri::generate_context!())
   .expect("MouseBorder failed to start");
  app.run(|handle,event|match event{

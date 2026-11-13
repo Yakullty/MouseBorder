@@ -3,15 +3,36 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
-    Pair { pin: String, label: String },
-    PairResult { ok: bool, key: Option<String>, label: Option<String> },
+    /// `token` re-authenticates a previously paired device without asking for the current code.
+    Pair {
+        pin: String,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// `trust` is the shared secret both ends keep for this pair, so either side can dial later.
+    PairResult {
+        ok: bool,
+        key: Option<String>,
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust: Option<String>,
+    },
     Input { event: InputEvent },
     Clipboard { text: String },
+    /// Base64 PNG. A screenshot is pixels, not a path the peer could resolve.
+    ClipboardImage { png: String },
+    /// Announces a file copy; the bytes follow as `FileChunk` messages in list order.
+    ClipboardFiles { transfer: u64, files: Vec<FileEntry> },
+    FileChunk { transfer: u64, data: String },
     ReturnControl,
     Control { enabled: bool },
     Ping,
     Disconnect,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileEntry { pub name: String, pub size: u64 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

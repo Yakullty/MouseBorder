@@ -1,11 +1,11 @@
-use crate::{input::{self, Captured, HookState}, protocol::{InputEvent, Message}};
+use crate::{clipboard, input::{self, Captured, HookState}, protocol::{InputEvent, Message}};
 use display_info::DisplayInfo;
 use futures_util::{stream::SplitStream, FutureExt, SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::{HashSet, VecDeque}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}, mpsc, Arc, Mutex, RwLock}, thread, time::Duration};
+use std::{collections::{HashSet, VecDeque}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}, mpsc, Arc, Mutex, RwLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{net::TcpListener, sync::mpsc as tmpsc};
 use tokio_tungstenite::{accept_async, connect_async_with_config, tungstenite::Message as WsMessage, WebSocketStream};
@@ -19,21 +19,27 @@ const PEER_PORT_ENV: &str = "MOUSEBORDER_PEER_PORT";
 const PIN_ENV: &str = "MOUSEBORDER_PIN";
 
 #[derive(Clone, Serialize)]
-pub struct UiState { pub hostname:String, pub pin:String, pub status:String, pub peer:String, pub edge:String, pub error:String, pub edge_enabled:bool, pub clipboard_enabled:bool, pub hook:String, pub control:String }
+pub struct UiState { pub hostname:String, pub pin:String, pub status:String, pub peer:String, pub edge:String, pub error:String, pub notice:String, pub edge_enabled:bool, pub clipboard_enabled:bool, pub hook:String, pub control:String, pub devices:Vec<Device> }
 #[derive(Serialize, Deserialize, Clone)]
 struct Packet { mac:String, body:Message }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Settings { pub edge:String, pub edge_enabled:bool, pub clipboard_enabled:bool }
-impl Default for Settings { fn default()->Self{ Self{ edge:"right".into(), edge_enabled:true, clipboard_enabled:true } } }
+pub struct Settings { pub edge:String, pub edge_enabled:bool, pub clipboard_enabled:bool, #[serde(default)] pub devices:Vec<Device> }
+impl Default for Settings { fn default()->Self{ Self{ edge:"right".into(), edge_enabled:true, clipboard_enabled:true, devices:Vec::new() } } }
+
+/// A peer we have paired with. `token` is the shared secret issued at pairing time; presenting it
+/// lets either side dial again without the current six-digit code. Forgetting the device on this
+/// machine also revokes the token, because incoming token auth is checked against this list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device { pub host:String, pub label:String, pub token:String }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Target { host:String, pin:String }
+struct Target { host:String, pin:String, token:Option<String> }
 
 pub struct Core {
     pub ui:Mutex<UiState>, pin:RwLock<String>, out:Mutex<Option<tmpsc::UnboundedSender<Message>>>,
     pub hook:HookState, app:Mutex<Option<AppHandle>>, clipboard_echo:Mutex<String>, pub edge_enabled:AtomicBool, pub clipboard_enabled:AtomicBool,
-    target:Mutex<Option<Target>>, link:AtomicUsize,
+    target:Mutex<Option<Target>>, link:AtomicUsize, devices:Mutex<Vec<Device>>, transfer:AtomicU64,
     capture:Mutex<Option<Arc<mpsc::Sender<Captured>>>>, hook_state:AtomicU8,
 }
 /// Hook thread outcomes, mirrored into `UiState.hook` for the settings UI.
@@ -44,7 +50,7 @@ impl Core {
         let pin=initial_pin(); let (sx,sy,sw,sh)=screen_rect(); let hook=HookState::new();
         hook.set_screen(sx,sy,sw,sh);
         let defaults=Settings::default();
-        Arc::new(Self{ui:Mutex::new(UiState{hostname,pin:pin.clone(),status:"waiting".into(),peer:String::new(),edge:defaults.edge.clone(),error:String::new(),edge_enabled:defaults.edge_enabled,clipboard_enabled:defaults.clipboard_enabled,hook:"stopped".into(),control:"local".into()}),pin:RwLock::new(pin),out:Mutex::new(None),hook,app:Mutex::new(None),clipboard_echo:Mutex::new(String::new()),edge_enabled:AtomicBool::new(defaults.edge_enabled),clipboard_enabled:AtomicBool::new(defaults.clipboard_enabled),target:Mutex::new(None),link:AtomicUsize::new(0),capture:Mutex::new(None),hook_state:AtomicU8::new(HOOK_STOPPED)})
+        Arc::new(Self{ui:Mutex::new(UiState{hostname,pin:pin.clone(),status:"waiting".into(),peer:String::new(),edge:defaults.edge.clone(),error:String::new(),notice:String::new(),edge_enabled:defaults.edge_enabled,clipboard_enabled:defaults.clipboard_enabled,hook:"stopped".into(),control:"local".into(),devices:Vec::new()}),pin:RwLock::new(pin),out:Mutex::new(None),hook,app:Mutex::new(None),clipboard_echo:Mutex::new(String::new()),edge_enabled:AtomicBool::new(defaults.edge_enabled),clipboard_enabled:AtomicBool::new(defaults.clipboard_enabled),target:Mutex::new(None),link:AtomicUsize::new(0),devices:Mutex::new(Vec::new()),transfer:AtomicU64::new(1),capture:Mutex::new(None),hook_state:AtomicU8::new(HOOK_STOPPED)})
     }
     pub fn set_app(&self,a:AppHandle){*self.app.lock().unwrap()=Some(a.clone());if let Some(s)=read_settings(&settings_path(&a)){self.apply_settings(&s);}}
     fn apply_settings(&self,s:&Settings){
@@ -53,10 +59,11 @@ impl Core {
         self.hook.set_edge(input::Edge::parse(&s.edge).unwrap_or_default());
         let connected=self.ui.lock().unwrap().status=="connected";
         self.hook.enabled.store(s.edge_enabled&&connected,Ordering::SeqCst);
-        self.update(|u|{u.edge=s.edge.clone();u.edge_enabled=s.edge_enabled;u.clipboard_enabled=s.clipboard_enabled;});
+        self.update(|u|{u.edge=s.edge.clone();u.edge_enabled=s.edge_enabled;u.clipboard_enabled=s.clipboard_enabled;u.devices=s.devices.clone();});
+        *self.devices.lock().unwrap()=s.devices.clone();
     }
     fn persist(&self){
-        let s=Settings{edge:self.ui.lock().unwrap().edge.clone(),edge_enabled:self.edge_enabled.load(Ordering::SeqCst),clipboard_enabled:self.clipboard_enabled.load(Ordering::SeqCst)};
+        let s=Settings{edge:self.ui.lock().unwrap().edge.clone(),edge_enabled:self.edge_enabled.load(Ordering::SeqCst),clipboard_enabled:self.clipboard_enabled.load(Ordering::SeqCst),devices:self.devices.lock().unwrap().clone()};
         let Some(app)=self.app.lock().unwrap().clone() else {return};
         write_settings(&settings_path(&app),&s);
     }
@@ -65,7 +72,36 @@ impl Core {
     pub fn set_edge(&self,side:String){if let Some(edge)=input::Edge::parse(&side){self.hook.set_edge(edge);self.update(|s|s.edge=edge.as_str().to_string());self.persist();}}
     pub fn set_edge_enabled(&self,on:bool){self.edge_enabled.store(on,Ordering::SeqCst);self.hook.enabled.store(on&&self.ui.lock().unwrap().status=="connected",Ordering::SeqCst);if !on{input::force_return(&self.hook);self.send(Message::ReturnControl);}self.update(|s|{s.edge_enabled=on;if !on{s.control="local".into();}});self.persist();}
     pub fn set_clipboard_enabled(&self,on:bool){self.clipboard_enabled.store(on,Ordering::SeqCst);self.update(|s|s.clipboard_enabled=on);self.persist();}
-    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::force_return(&self.hook);self.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});}
+    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::force_return(&self.hook);self.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();s.notice.clear();});}
+    /// Ends the retry loop belonging to `gen` after the *peer* asked to disconnect. The CAS is what
+    /// makes this safe: a connect or disconnect the user issued in the meantime owns a newer
+    /// generation and must not be clobbered by this late cleanup.
+    fn stop_retrying(&self,gen:usize){
+        if self.link.compare_exchange(gen,gen+1,Ordering::SeqCst,Ordering::SeqCst).is_ok(){
+            self.target.lock().unwrap().take();
+            self.update(|s|s.notice="对端已断开连接".into());
+        }
+    }
+    fn remember(&self,host:String,label:String,token:String){
+        let label=if label.trim().is_empty(){host.clone()}else{label};
+        let mut list=self.devices.lock().unwrap();
+        match list.iter_mut().find(|d|d.host==host){Some(d)=>{d.label=label;d.token=token;},None=>list.push(Device{host,label,token})}
+        let snapshot=list.clone();drop(list);
+        self.update(|s|s.devices=snapshot);
+        self.persist();
+    }
+    pub fn forget_device(&self,host:String){
+        self.devices.lock().unwrap().retain(|d|d.host!=host);
+        let snapshot=self.devices.lock().unwrap().clone();
+        self.update(|s|s.devices=snapshot);
+        self.persist();
+    }
+    fn token_for(&self,host:&str)->Option<String>{self.devices.lock().unwrap().iter().find(|d|d.host==host).map(|d|d.token.clone())}
+    /// Dials a remembered device using its stored token, so no code has to be typed again.
+    pub fn connect_device(self:&Arc<Self>,host:String){
+        let Some(token)=self.token_for(&host) else {self.update(|s|s.error="没有这台设备的授权记录，请用配对码连接".into());return};
+        self.dial(Target{host,pin:String::new(),token:Some(token)});
+    }
     pub fn send(&self,m:Message){if let Some(tx)=self.out.lock().unwrap().as_ref(){let _=tx.send(m);}}
     pub fn start(self:&Arc<Self>){
         let c=self.clone();tauri::async_runtime::spawn(async move{if let Err(e)=server(c.clone()).await{c.update(|s|s.error=format!("本机监听启动失败：{e}"));}});
@@ -74,7 +110,49 @@ impl Core {
         // Displays can be plugged in or rearranged while the app runs; the handoff edges follow.
         let c=self.clone();thread::spawn(move||loop{let(x,y,w,h)=screen_rect();c.hook.set_screen(x,y,w,h);thread::sleep(Duration::from_secs(2));});
         self.spawn_hook();
-        let c=self.clone();thread::spawn(move||{let mut previous=String::new();loop{if let Ok(mut clip)=arboard::Clipboard::new(){if c.clipboard_enabled.load(Ordering::Relaxed){if let Ok(text)=clip.get_text(){if text!=previous&&text!=*c.clipboard_echo.lock().unwrap(){previous=text.clone();c.send(Message::Clipboard{text});}}}}thread::sleep(Duration::from_millis(500));}});
+        let c=self.clone();thread::spawn(move||{let mut previous=String::new();loop{
+            if c.clipboard_enabled.load(Ordering::Relaxed){
+                if let Ok(mut clip)=arboard::Clipboard::new(){
+                    if let Some((sig,payload))=clipboard::read(&mut clip){
+                        if sig!=previous{
+                            previous=sig.clone();
+                            if sig!=*c.clipboard_echo.lock().unwrap(){c.send_payload(&payload);}
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }});
+    }
+    fn send_payload(&self,payload:&clipboard::Payload){
+        match payload{
+            clipboard::Payload::Text(text)=>self.send(Message::Clipboard{text:text.clone()}),
+            clipboard::Payload::Image(png)=>self.send(Message::ClipboardImage{png:clipboard::b64(png)}),
+            clipboard::Payload::Files(paths)=>match clipboard::plan(paths){
+                Err(e)=>self.update(|s|s.error=e),
+                Ok((files,paths))=>{
+                    let transfer=self.transfer.fetch_add(1,Ordering::SeqCst);
+                    self.send(Message::ClipboardFiles{transfer,files});
+                    for path in paths{
+                        if let Err(e)=clipboard::read_chunks(&path,|data|self.send(Message::FileChunk{transfer,data})){
+                            self.update(|s|s.error=format!("读取文件失败：{e}"));break;
+                        }
+                    }
+                }
+            },
+        }
+    }
+    /// Writes a received payload and records what the clipboard actually holds afterwards, so the
+    /// poller sees our own write as an echo instead of a fresh copy to send back.
+    fn receive_payload(self:&Arc<Self>,payload:clipboard::Payload){
+        let c=self.clone();
+        let _=tauri::async_runtime::spawn_blocking(move||{
+            let Ok(mut clip)=arboard::Clipboard::new() else {return};
+            *c.clipboard_echo.lock().unwrap()=clipboard::signature(&payload);
+            if clipboard::write(&mut clip,&payload).is_ok(){
+                if let Some((sig,_))=clipboard::read(&mut clip){*c.clipboard_echo.lock().unwrap()=sig;}
+            }
+        });
     }
     /// (Re)creates the suppressing system hook. macOS consults the permission when the tap is
     /// created, so a grant made while this process was already running only takes effect here.
@@ -93,10 +171,14 @@ impl Core {
         let (host,pin)=(host.trim().to_string(),pin.trim().to_string());
         let Ok(ip)=host.parse::<std::net::IpAddr>() else {self.update(|s|s.error="请输入有效的 IPv4/IPv6 地址".into());return};
         if !valid_pin(&pin) {self.update(|s|s.error="配对码必须是六位数字".into());return}
-        let target=Target{host:ip.to_string(),pin};
+        let host=ip.to_string();
+        let token=self.token_for(&host);
+        self.dial(Target{host,pin,token});
+    }
+    fn dial(self:&Arc<Self>,target:Target){
         *self.target.lock().unwrap()=Some(target.clone());
         let gen=self.link.fetch_add(1,Ordering::SeqCst)+1;
-        self.update(|s|{s.error.clear();s.status="connecting".into();s.peer=target.host.clone();});
+        self.update(|s|{s.error.clear();s.notice.clear();s.status="connecting".into();s.peer=target.host.clone();});
         let c=self.clone();tauri::async_runtime::spawn(async move{attempt(c,gen,target).await;});
     }
 }
@@ -162,13 +244,22 @@ pub fn write_settings(path:&Path,s:&Settings){
 }
 async fn server(core:Arc<Core>)->Result<(),String>{
     let listener=TcpListener::bind(("0.0.0.0",listen_port())).await.map_err(|e|e.to_string())?;
-    loop{let(stream,_)=listener.accept().await.map_err(|e|e.to_string())?;let _=stream.set_nodelay(true);let c=core.clone();tauri::async_runtime::spawn(async move{
+    loop{let(stream,addr)=listener.accept().await.map_err(|e|e.to_string())?;let _=stream.set_nodelay(true);let c=core.clone();tauri::async_runtime::spawn(async move{
         if c.ui.lock().unwrap().status!="waiting"{return;}
+        let host=addr.ip().to_string();
         let Ok(mut ws)=accept_async(stream).await else{return};let Some(Ok(WsMessage::Text(txt)))=ws.next().await else{return};
-        let Ok(Message::Pair{pin,label})=serde_json::from_str(&txt) else{return};
-        if pin!=*c.pin.read().unwrap(){let bad=Message::PairResult{ok:false,key:None,label:None};let _=ws.send(WsMessage::Text(serde_json::to_string(&bad).unwrap().into())).await;return;}
-        let key=make_key();let reply=Message::PairResult{ok:true,key:Some(key.clone()),label:Some(c.ui.lock().unwrap().hostname.clone())};
-        if ws.send(WsMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.is_ok(){install(c,ws,key,label).await;}
+        let Ok(Message::Pair{pin,label,token})=serde_json::from_str(&txt) else{return};
+        // A remembered token stands in for the code, but only one this machine still holds: that is
+        // what makes 忘记 on our side revoke the peer's ability to dial back in without a code.
+        let known=token.filter(|t|!t.is_empty()&&c.token_for(&host).as_deref()==Some(t.as_str()));
+        let trusted=known.is_some();
+        if !trusted&&pin!=*c.pin.read().unwrap(){let bad=Message::PairResult{ok:false,key:None,label:None,trust:None};let _=ws.send(WsMessage::Text(serde_json::to_string(&bad).unwrap().into())).await;return;}
+        let trust=known.unwrap_or_else(make_key);
+        let key=make_key();let reply=Message::PairResult{ok:true,key:Some(key.clone()),label:Some(c.ui.lock().unwrap().hostname.clone()),trust:Some(trust.clone())};
+        if ws.send(WsMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.is_ok(){
+            c.remember(host,label.clone(),trust);
+            install(c,ws,key,label).await;
+        }
     });}
 }
 async fn connect_peer(core:Arc<Core>,target:&Target)->Result<(),String>{
@@ -176,11 +267,13 @@ async fn connect_peer(core:Arc<Core>,target:&Target)->Result<(),String>{
     // Nagle holds a small mouse frame until the peer acknowledges the previous one, which on a LAN
     // is a 40-200 ms stall per burst and is felt as a stuttering pointer rather than as latency.
     let(mut ws,_)=connect_async_with_config(format!("ws://{addr}"),None,true).await.map_err(|e|e.to_string())?;
-    let pair=Message::Pair{pin:target.pin.clone(),label:core.ui.lock().unwrap().hostname.clone()};
+    let pair=Message::Pair{pin:target.pin.clone(),label:core.ui.lock().unwrap().hostname.clone(),token:target.token.clone()};
     ws.send(WsMessage::Text(serde_json::to_string(&pair).unwrap().into())).await.map_err(|e|e.to_string())?;
     let Some(Ok(WsMessage::Text(reply)))=ws.next().await else{return Err("对端未返回配对结果".into())};
-    let Message::PairResult{ok,key,label}=serde_json::from_str(&reply).map_err(|_|"对端配对响应格式错误，双方需使用同一版本".to_string())? else{return Err("对端配对响应格式错误，双方需使用同一版本".into())};
-    if !ok{return Err("配对码错误或已刷新".into())}
+    let Message::PairResult{ok,key,label,trust}=serde_json::from_str(&reply).map_err(|_|"对端配对响应格式错误，双方需使用同一版本".to_string())? else{return Err("对端配对响应格式错误，双方需使用同一版本".into())};
+    if !ok{return Err(if target.token.is_some(){"配对码错误或授权已失效，请重新用配对码连接".into()}else{"配对码错误或已刷新".into()})}
+    let host=target.host.clone();
+    if let Some(trust)=trust{core.remember(host,label.clone().unwrap_or_default(),trust);}
     install(core,ws,key.ok_or("对端没有提供会话密钥")?,label.unwrap_or(target.host.clone())).await;
     Ok(())
 }
@@ -188,12 +281,16 @@ async fn install<S>(core:Arc<Core>,ws:WebSocketStream<S>,key:String,peer:String)
 where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
     let(tx,mut rx)=tmpsc::unbounded_channel::<Message>();
     {let mut out=core.out.lock().unwrap();if out.is_some(){return}*out=Some(tx);}
+    // Captured before any await: if the peer hangs up we end exactly this generation's retry loop.
+    let gen=core.link.load(Ordering::SeqCst);
     let(mut sink,mut stream)=ws.split();
     core.hook.enabled.store(core.edge_enabled.load(Ordering::SeqCst),Ordering::SeqCst);
-    core.update(|s|{s.status="connected".into();s.peer=peer;s.error.clear();});
+    core.update(|s|{s.status="connected".into();s.peer=peer;s.error.clear();s.notice.clear();});
     let k=key.clone();let writer=tauri::async_runtime::spawn(async move{while let Some(body)=rx.recv().await{let Ok(bytes)=serde_json::to_vec(&body)else{continue};let mut h=HmacSha256::new_from_slice(k.as_bytes()).unwrap();h.update(&bytes);let packet=Packet{mac:hex(&h.finalize().into_bytes()),body};if let Ok(text)=serde_json::to_string(&packet){if sink.send(WsMessage::Text(text.into())).await.is_err(){break;}}}});
     let(x,y,w,h)=screen_rect();let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
     let mut queued:VecDeque<Message>=VecDeque::new();
+    let mut incoming:Option<clipboard::Incoming>=None;
+    let mut peer_closed=false;
     loop{
         let body=match queued.pop_front(){Some(b)=>b,None=>match next_body(&mut stream,&key).await{Some(b)=>b,None=>break}};
         match body{
@@ -212,12 +309,41 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
             if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}
         },
         Message::Control{enabled}=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
-        Message::Disconnect=>break,
+        Message::Disconnect=>{peer_closed=true;break},
         Message::ReturnControl=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
         // Awaiting the clipboard thread here would stall every input frame queued behind it.
-        Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>{*core.clipboard_echo.lock().unwrap()=text.clone();let _=tauri::async_runtime::spawn_blocking(move||if let Ok(mut c)=arboard::Clipboard::new(){let _=c.set_text(text);});},_=>{}
+        Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>core.receive_payload(clipboard::Payload::Text(text)),
+        Message::ClipboardImage{png} if core.clipboard_enabled.load(Ordering::Relaxed)=>match clipboard::unb64(&png){
+            Some(bytes)=>core.receive_payload(clipboard::Payload::Image(bytes)),
+            None=>core.update(|s|s.error="收到的图片数据无法解码".into()),
+        },
+        Message::ClipboardFiles{transfer,files} if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+            let count=files.len();
+            match clipboard::Incoming::new(transfer,files,received_dir(&core,transfer)){
+                Ok(inc)=>{incoming=Some(inc);core.update(|s|s.notice=format!("正在接收 {count} 个文件…"));},
+                Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
+            }
+        },
+        Message::FileChunk{transfer,data} if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+            let Some(inc)=incoming.as_mut().filter(|i|i.transfer==transfer) else {continue};
+            let Some(bytes)=clipboard::unb64(&data) else {continue};
+            match inc.chunk(&bytes){
+                Ok(true)=>{let paths=std::mem::take(&mut inc.done);incoming=None;
+                    core.update(|s|s.notice=format!("已接收 {} 个文件，可直接粘贴",paths.len()));
+                    core.receive_payload(clipboard::Payload::Files(paths));},
+                Ok(false)=>{},
+                Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
+            }
+        },_=>{}
     }}
     writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::force_return(&core.hook);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});
+    if peer_closed{core.stop_retrying(gen);}
+}
+/// Received files land under the app's own data directory, one folder per transfer, and the
+/// clipboard is then pointed at them so a paste on this machine yields real files.
+fn received_dir(core:&Core,transfer:u64)->PathBuf{
+    let base=core.app.lock().unwrap().as_ref().and_then(|a|a.path().app_data_dir().ok()).unwrap_or_else(std::env::temp_dir);
+    base.join("received").join(transfer.to_string())
 }
 /// Next verified body, or `None` once the link ends. Non-text frames and failed MACs are skipped.
 async fn next_body<S>(stream:&mut SplitStream<WebSocketStream<S>>,key:&str)->Option<Message>
@@ -320,8 +446,8 @@ mod tests {
 
     #[test]
     fn pairing_enums_use_snake_case_tags() {
-        assert_eq!(serde_json::to_string(&Message::Pair{pin:"123456".into(),label:"Mac".into()}).unwrap(),r#"{"type":"pair","pin":"123456","label":"Mac"}"#);
-        assert_eq!(serde_json::to_string(&Message::PairResult{ok:true,key:Some("k".into()),label:None}).unwrap(),r#"{"type":"pair_result","ok":true,"key":"k","label":null}"#);
+        assert_eq!(serde_json::to_string(&Message::Pair{pin:"123456".into(),label:"Mac".into(),token:None}).unwrap(),r#"{"type":"pair","pin":"123456","label":"Mac"}"#);
+        assert_eq!(serde_json::to_string(&Message::PairResult{ok:true,key:Some("k".into()),label:None,trust:None}).unwrap(),r#"{"type":"pair_result","ok":true,"key":"k","label":null}"#);
     }
 
     #[test]
@@ -350,15 +476,20 @@ mod tests {
         let path=dir.join("settings.json");
         let _=std::fs::remove_dir_all(&dir);
         assert_eq!(read_settings(&path),None,"a missing file must fall back to defaults");
-        let s=Settings{edge:"left".into(),edge_enabled:false,clipboard_enabled:true};
+        let s=Settings{edge:"left".into(),edge_enabled:false,clipboard_enabled:true,devices:vec![Device{host:"192.168.1.25".into(),label:"PC".into(),token:"t".into()}]};
         write_settings(&path,&s);
         assert_eq!(read_settings(&path).as_ref(),Some(&s));
         for edge in ["top","bottom"] {
-            write_settings(&path,&Settings{edge:edge.into(),edge_enabled:true,clipboard_enabled:true});
+            write_settings(&path,&Settings{edge:edge.into(),edge_enabled:true,clipboard_enabled:true,devices:Vec::new()});
             assert_eq!(read_settings(&path).unwrap().edge,edge,"{edge} is a valid side and must survive");
         }
-        write_settings(&path,&Settings{edge:"diagonal".into(),edge_enabled:true,clipboard_enabled:true});
+        write_settings(&path,&Settings{edge:"diagonal".into(),edge_enabled:true,clipboard_enabled:true,devices:Vec::new()});
         assert_eq!(read_settings(&path).unwrap().edge,"right");
+        // A settings file written before devices existed must still load.
+        std::fs::write(&path,br#"{"edge":"left","edge_enabled":true,"clipboard_enabled":true}"#).unwrap();
+        let old=read_settings(&path).unwrap();
+        assert_eq!(old.edge,"left");
+        assert!(old.devices.is_empty());
         std::fs::write(&path,b"not json").unwrap();
         assert_eq!(read_settings(&path),None);
         let _=std::fs::remove_dir_all(&dir);
@@ -432,20 +563,63 @@ mod tests {
     #[test]
     fn targets_are_compared_by_host_and_code() {
         let core=Core::new();
-        let a=Target{host:"192.168.1.25".into(),pin:"123456".into()};
+        let a=Target{host:"192.168.1.25".into(),pin:"123456".into(),token:None};
         assert!(stale(&core,0,&a),"with nothing dialled no attempt owns the link");
         *core.target.lock().unwrap()=Some(a.clone());
         assert!(!stale(&core,0,&a));
         assert!(stale(&core,1,&a),"a superseding connect must stop the older attempt");
-        assert!(stale(&core,0,&Target{host:a.host.clone(),pin:"654321".into()}),"a refreshed code must stop the old attempt");
+        assert!(stale(&core,0,&Target{host:a.host.clone(),pin:"654321".into(),token:None}),"a refreshed code must stop the old attempt");
         core.disconnect();
         assert!(stale(&core,0,&a),"disconnecting clears the dial target");
     }
 
     #[test]
+    fn a_peer_disconnect_ends_the_retry_loop_without_touching_a_newer_one() {
+        let core=Core::new();
+        let target=Target{host:"192.168.1.25".into(),pin:String::new(),token:Some("t".into())};
+        *core.target.lock().unwrap()=Some(target.clone());
+        let gen=core.link.load(Ordering::SeqCst);
+        assert!(!stale(&core,gen,&target));
+        core.stop_retrying(gen);
+        assert!(stale(&core,gen,&target),"the dialer must not redial after the peer hung up");
+        assert!(core.target.lock().unwrap().is_none());
+        assert_eq!(core.ui.lock().unwrap().notice,"对端已断开连接");
+
+        // A connect the user issued while the old session was tearing down owns a newer generation.
+        let newer=Target{host:"192.168.1.30".into(),pin:"123456".into(),token:None};
+        *core.target.lock().unwrap()=Some(newer.clone());
+        let current=core.link.load(Ordering::SeqCst);
+        core.stop_retrying(gen);
+        assert_eq!(core.link.load(Ordering::SeqCst),current,"a stale cleanup must not bump the link");
+        assert_eq!(core.target.lock().unwrap().as_ref(),Some(&newer),"the newer target must survive");
+    }
+
+    #[test]
+    fn a_remembered_device_can_be_dialled_and_forgotten() {
+        let core=Core::new();
+        core.remember("192.168.1.25".into(),"PC".into(),"token-a".into());
+        assert_eq!(core.token_for("192.168.1.25").as_deref(),Some("token-a"));
+        assert_eq!(core.ui.lock().unwrap().devices.len(),1);
+        // Re-pairing the same host updates the record instead of stacking a duplicate.
+        core.remember("192.168.1.25".into(),"PC-2".into(),"token-b".into());
+        let devices=core.ui.lock().unwrap().devices.clone();
+        assert_eq!(devices.len(),1);
+        assert_eq!(devices[0].label,"PC-2");
+        assert_eq!(core.token_for("192.168.1.25").as_deref(),Some("token-b"));
+        // An empty label falls back to the address so the row is never blank.
+        core.remember("192.168.1.30".into(),"  ".into(),"token-c".into());
+        assert_eq!(core.ui.lock().unwrap().devices[1].label,"192.168.1.30");
+        core.forget_device("192.168.1.25".into());
+        assert_eq!(core.token_for("192.168.1.25"),None,"forgetting must revoke the stored token");
+        assert_eq!(core.ui.lock().unwrap().devices.len(),1);
+        core.connect_device("192.168.1.25".into());
+        assert!(core.ui.lock().unwrap().error.contains("授权记录"),"a forgotten device must not dial");
+    }
+
+    #[test]
     fn persisted_settings_gate_the_live_flags() {
         let core=Core::new();
-        core.apply_settings(&Settings{edge:"left".into(),edge_enabled:false,clipboard_enabled:false});
+        core.apply_settings(&Settings{edge:"left".into(),edge_enabled:false,clipboard_enabled:false,devices:Vec::new()});
         assert!(!core.edge_enabled.load(Ordering::SeqCst));
         assert!(!core.clipboard_enabled.load(Ordering::SeqCst));
         assert_eq!(core.hook.edge(),Edge::Left);

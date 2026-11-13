@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MouseBorder",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "identifier": "com.mouseborder.native",
   "build": { "frontendDist": "ui" },
   "app": {
-    "windows": [{ "title": "MouseBorder", "width": 860, "height": 620, "minWidth": 740, "minHeight": 520 }],
+    "windows": [{ "title": "MouseBorder", "width": 460, "height": 600, "minWidth": 400, "minHeight": 480 }],
     "withGlobalTauri": true, "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost" }
   },
   "bundle": { "active": true, "targets": ["dmg", "app", "nsis"], "category": "Utility", "icon": ["icons/icon.icns", "icons/icon.ico", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"] }
