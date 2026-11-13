@@ -161,8 +161,9 @@ pub fn anchor_point(r:Rect, edge:Edge)->(f64,f64){
     }
 }
 
-/// The obstacle border the ghost cursor is pressed against, if any. The handoff and hand-back bands
-/// are deliberately left alone: they are triggers, not obstacles.
+/// The obstacle border the ghost cursor is pressed against, if any. On the watched axis only the
+/// border the pointer came through blocks it; the opposite border is the hand-back trigger and has
+/// to stay reachable.
 pub fn reanchor(x:f64, y:f64, r:Rect, edge:Edge)->Option<(f64,f64)>{
     if r.w<2.0 || r.h<2.0 { return None; }
     let (ax,ay)=anchor_point(r,edge);
@@ -286,9 +287,9 @@ fn move_event(x:f64,y:f64,dx:f64,dy:f64,relative:bool,state:&HookState,mem:&mut 
 
     if !relative {
         // Absolute capture (rdev's Windows hook) reports where the pointer is rather than how far
-        // it moved, and it can travel to the far border, so reaching that border is the return
-        // gesture. Near an obstacle border the ghost cursor is pulled back inside to keep deltas
-        // flowing; the handoff border is where control would be handed back, so it is excluded.
+        // it moved, and it can travel to the far border, so reaching that border hands control back.
+        // The border it came through is an obstacle instead: the ghost cursor is pulled back inside
+        // so physical travel keeps producing position changes.
         if return_reached(edge.coord(x,y),lo,hi,low) {
             leave_remote(state,mem,tx);
             restore_pointer(state,x,y);
