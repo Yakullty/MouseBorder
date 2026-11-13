@@ -63,9 +63,9 @@ impl Core {
     fn update(&self,f:impl FnOnce(&mut UiState)){let mut s=self.ui.lock().unwrap();f(&mut s);if let Some(a)=self.app.lock().unwrap().as_ref(){let _=a.emit("state",s.clone());}}
     pub fn refresh_pin(&self)->String{let p=make_pin();*self.pin.write().unwrap()=p.clone();self.update(|s|s.pin=p.clone());p}
     pub fn set_edge(&self,side:String){if let Some(edge)=input::Edge::parse(&side){self.hook.set_edge(edge);self.update(|s|s.edge=edge.as_str().to_string());self.persist();}}
-    pub fn set_edge_enabled(&self,on:bool){self.edge_enabled.store(on,Ordering::SeqCst);self.hook.enabled.store(on&&self.ui.lock().unwrap().status=="connected",Ordering::SeqCst);if !on{input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.send(Message::ReturnControl);}self.update(|s|{s.edge_enabled=on;if !on{s.control="local".into();}});self.persist();}
+    pub fn set_edge_enabled(&self,on:bool){self.edge_enabled.store(on,Ordering::SeqCst);self.hook.enabled.store(on&&self.ui.lock().unwrap().status=="connected",Ordering::SeqCst);if !on{input::force_return(&self.hook);self.send(Message::ReturnControl);}self.update(|s|{s.edge_enabled=on;if !on{s.control="local".into();}});self.persist();}
     pub fn set_clipboard_enabled(&self,on:bool){self.clipboard_enabled.store(on,Ordering::SeqCst);self.update(|s|s.clipboard_enabled=on);self.persist();}
-    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::restore_pointer(&self.hook,0.0,0.0);self.hook.remote.store(false,Ordering::SeqCst);self.hook.receiving.store(false,Ordering::SeqCst);self.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});}
+    pub fn disconnect(&self){self.link.fetch_add(1,Ordering::SeqCst);*self.target.lock().unwrap()=None;self.send(Message::Disconnect);input::force_return(&self.hook);self.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});}
     pub fn send(&self,m:Message){if let Some(tx)=self.out.lock().unwrap().as_ref(){let _=tx.send(m);}}
     pub fn start(self:&Arc<Self>){
         let c=self.clone();tauri::async_runtime::spawn(async move{if let Err(e)=server(c.clone()).await{c.update(|s|s.error=format!("本机监听启动失败：{e}"));}});
@@ -195,10 +195,10 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
         Message::Input{event}=>{match &event{crate::protocol::InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},crate::protocol::InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}},
         Message::Control{enabled}=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
         Message::Disconnect=>break,
-        Message::ReturnControl=>{input::restore_pointer(&core.hook,inj.cursor.0,inj.cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);core.update(|s|s.control="local".into());},
+        Message::ReturnControl=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
         Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>{*core.clipboard_echo.lock().unwrap()=text.clone();let _=tauri::async_runtime::spawn_blocking(move||if let Ok(mut c)=arboard::Clipboard::new(){let _=c.set_text(text);}).await;},_=>{}
     }}
-    writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::restore_pointer(&core.hook,inj.cursor.0,inj.cursor.1);core.hook.remote.store(false,Ordering::SeqCst);core.hook.receiving.store(false,Ordering::SeqCst);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});
+    writer.abort();for key in held_keys{let _=input::release_key(&key);}for button in held_buttons{let _=input::release_button(button);}core.hook.enabled.store(false,Ordering::SeqCst);input::force_return(&core.hook);*core.out.lock().unwrap()=None;core.update(|s|{s.status="waiting".into();s.peer.clear();s.control="local".into();});
 }
 fn verify(key:&str,p:&Packet)->bool{let Ok(bytes)=serde_json::to_vec(&p.body)else{return false};let Ok(mut h)=HmacSha256::new_from_slice(key.as_bytes())else{return false};h.update(&bytes);h.verify_slice(&unhex(&p.mac)).is_ok()}
 fn hex(bytes:&[u8])->String{bytes.iter().map(|b|format!("{b:02x}")).collect()}

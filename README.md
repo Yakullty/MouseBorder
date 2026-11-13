@@ -15,7 +15,8 @@
 | Windows 代码可编译 | 由 CI 验证 | GitHub Actions `windows-latest`；本机 `cargo check --target x86_64-pc-windows-msvc` 会在 `tauri-build` 处失败（缺 SDK 的 `llvm-rc`/`rc.exe`） |
 | 接收端注入（移动/滚轮/坏 MAC 拒绝/还原） | 已验证（macOS 实机） | `native/tests/input_link.rs` 实机通过 |
 | 多屏并集几何、四侧交接、滚轮单位换算 | 已验证逻辑 | `cargo test` 单元测试 |
-| 边缘交接手感 | **未验证** | 需要双机实测 |
+| 跨屏状态机（进入钉点、设备位移驱动、外推交还、0.2s 宽限 / 0.5s 冷却、按住鼠标键不交还、落点换算） | 已验证逻辑 | `cargo test` 单元测试 |
+| 边缘交接手感（本机光标是否真的钉住、隐藏是否生效） | **未验证** | 需要双机实测；交接时日志里的 `pointer pinned … cursor hidden / STILL VISIBLE` 是判据 |
 
 macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIToolbox 的 `TISGetInputSourceProperty`，而该 API 断言必须在主队列执行，tap 回调跑在后台线程，第一次物理按键就会 `dispatch_assert_queue_fail` → SIGTRAP。现在由 [native/src/tap.rs](native/src/tap.rs) 自建 `CGEventTap`，只读标量字段，并直接取设备相对位移；注入仍走 `rdev::simulate`。
 
@@ -23,11 +24,14 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 
 - 手动 IPv4/IPv6 + 六位配对码，配对码可刷新。
 - TCP/WebSocket 端口 `39876`；配对后每条消息带 HMAC-SHA256，校验失败静默丢弃。
-- 全局输入钩子：越过右/左/上/下任一侧边缘把控制权交给对端；被控端光标顶到**朝向对端的那条边**或 `Ctrl+Alt+Esc` 交还。界面顶部徽章实时显示「本机控制 / 正在控制对端 / 对端控制本机」。
+- 全局输入钩子：越过右/左/上/下任一侧边缘把控制权交给对端；被控端光标顶到**朝向对端的那条边**、或推回进入时的边缘、或 `Ctrl+Alt+Esc` 交还。界面顶部徽章实时显示「本机控制 / 正在控制对端 / 对端控制本机」。
+- macOS 交接时**真正锁住本机光标**：`CGAssociateMouseAndMouseCursorPosition(0)` 逐帧重申、事件坐标改写到离开点、鼠标增量清零后放行——只吞事件是拦不住指针的（吞掉时光标照样跟着硬件跑，这也是旧版「跨屏后本机鼠标还在动」的原因）。光标隐藏需要先用未公开的 `SetsCursorInBackground` 解锁本进程的 WindowServer 连接，否则后台应用调用 `CGDisplayHideCursor` 会返回成功却什么都不做。每次交接在日志里写一行 `pointer pinned for the peer (background control …; cursor hidden)`，其中 `STILL VISIBLE` 就是解锁失败的证据。
+- 交还判据是**持续外推**：对端光标贴住进入的那条边、连续把鼠标往该方向推过约 2% 屏宽（1200/65535）才交还；进入后 0.2s 内忽略、交还后 0.5s 内不再接管、按住鼠标键期间不交还（拖拽/框选不被打断）。同时把滚轮、按键、鼠标键**全部转发给对端并在本机吞掉**，所以不会再出现「光标在 Windows 上、滚轮还在滚 Mac」。
+- 进入时驱动端发送一次绝对落点（`MoveTo`），对端光标出现在**朝向本机的那条边**上，而不是对端桌面正中间——否则往回推要先横跨半个屏幕。
 - 鼠标移动、按键、滚轮、常用键盘键注入；文本剪贴板 500ms 轮询同步。
 - 几何按**所有显示器的并集矩形**计算（副屏在主屏左/上方时原点为负），每 2s 跟随插拔与分辨率变化。Windows 的绝对移动不走 rdev：它按 `GetSystemMetrics(SM_CXVIRTUALSCREEN)` 归一化，而该值受 DPI 虚拟化影响，缩放桌面上会与 `display_info` 的 DEVMODE 并集不一致；现在自己按同一个并集矩形换算成 0..65535 再 `SendInput`（`VIRTUALDESK`），光标回拉也走这条路径。
 - 滚轮在线路上统一为 1/120 格（Windows `WHEEL_DELTA`）：macOS 的像素增量按每格约 10px 换算，注入时保留小数余数累加，触控板的细碎增量不会被逐条截断成 0。
-- 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题）；macOS 逐屏隐藏光标，副屏上不会留下可见的幽灵光标。
+- 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题，Windows 驱动端）；macOS 驱动端改为钉住光标，不再需要幽灵游走。
 - 断线自动重连（1→2→4→…10s 退避）；配对码错误等不可自愈的情况停止并提示。
 - 设置写入 `<appData>/settings.json`，重启后保留。
 
@@ -38,7 +42,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 ```sh
 cd native
 cargo tauri dev     # 调试运行
-cargo test          # 34 个单元测试
+cargo test          # 45 个单元测试
 ```
 
 ### 本机端到端自测（不需要第二台机器）

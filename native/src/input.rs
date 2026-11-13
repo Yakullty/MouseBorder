@@ -2,7 +2,10 @@ use crate::protocol::{InputEvent, MouseButton};
 use rdev::{simulate, Button, EventType, Key};
 #[cfg(not(target_os="macos"))] use rdev::{grab, Event};
 #[cfg(not(target_os="macos"))] use std::sync::Mutex;
-use std::{sync::{atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering}, mpsc::Sender, Arc}, time::Duration};
+use std::{
+    sync::{atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering}, mpsc::Sender, Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone)]
 pub enum Captured { EnterRemote, ReturnLocal, Event(InputEvent) }
@@ -14,6 +17,25 @@ pub enum Captured { EnterRemote, ReturnLocal, Event(InputEvent) }
 const REANCHOR_MARGIN: f64 = 40.0;
 /// Travel room restored by one re-anchor, in points.
 const REANCHOR_PULL: f64 = 320.0;
+
+/// Pushing back out through the border control arrived from hands it back; the push has to add up
+/// to this much (1/65535 of the axis, about 2 % of a display) so a jittery frame cannot bounce.
+const EXIT_OUTWARD: f64 = 1200.0;
+/// Brushing the border on the way out must not bounce straight back, so the exit test is ignored
+/// for this long after entering.
+const ENTRY_GRACE: Duration = Duration::from_millis(200);
+/// The momentum of the hand-back push leaves the pointer pressed against the border; control must
+/// not be handed out again until that has had time to bleed off.
+const EXIT_COOLDOWN: Duration = Duration::from_millis(500);
+/// ...and until the pointer has left the band, capped by this delay so a pointer parked on the
+/// border cannot block the handoff for ever.
+const REARM_DELAY: Duration = Duration::from_millis(700);
+
+/// Milliseconds on a process-wide monotonic clock. Timestamps shared through atomics use it.
+pub fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 /// Wheel deltas travel as 1/120 of a notch, the unit Windows' WHEEL_DELTA and rdev's Windows
 /// backend use. Each capture layer scales its own device unit up to this, each injector back down.
@@ -61,19 +83,50 @@ pub struct HookState {
     pub screen_y: Arc<AtomicI32>,
     pub screen_w: Arc<AtomicU32>,
     pub screen_h: Arc<AtomicU32>,
+    /// `now_ms()` before which the handoff border must not fire.
+    pub entry_blocked_until: Arc<AtomicU64>,
+    /// Set when control was just handed back, cleared once the pointer leaves the border band.
+    pub entry_rearm: Arc<AtomicBool>,
 }
 impl HookState {
-    pub fn new() -> Self { Self { enabled:Arc::new(AtomicBool::new(false)), remote:Arc::new(AtomicBool::new(false)), receiving:Arc::new(AtomicBool::new(false)), injection:Arc::new(AtomicBool::new(false)), cursor_hidden:Arc::new(AtomicBool::new(false)), edge_code:Arc::new(AtomicU32::new(Edge::Right.code())), screen_x:Arc::new(AtomicI32::new(0)), screen_y:Arc::new(AtomicI32::new(0)), screen_w:Arc::new(AtomicU32::new(0)), screen_h:Arc::new(AtomicU32::new(0)) } }
+    pub fn new() -> Self { Self { enabled:Arc::new(AtomicBool::new(false)), remote:Arc::new(AtomicBool::new(false)), receiving:Arc::new(AtomicBool::new(false)), injection:Arc::new(AtomicBool::new(false)), cursor_hidden:Arc::new(AtomicBool::new(false)), edge_code:Arc::new(AtomicU32::new(Edge::Right.code())), screen_x:Arc::new(AtomicI32::new(0)), screen_y:Arc::new(AtomicI32::new(0)), screen_w:Arc::new(AtomicU32::new(0)), screen_h:Arc::new(AtomicU32::new(0)), entry_blocked_until:Arc::new(AtomicU64::new(0)), entry_rearm:Arc::new(AtomicBool::new(false)) } }
+    /// Keeps the handoff border from firing until `d` has passed and the pointer has left the band.
+    pub fn block_entry(&self, d: Duration) {
+        self.entry_blocked_until.store(now_ms() + d.as_millis() as u64, Ordering::SeqCst);
+        self.entry_rearm.store(true, Ordering::SeqCst);
+    }
     pub fn set_screen(&self,x:i32,y:i32,w:u32,h:u32){ self.screen_x.store(x,Ordering::Relaxed); self.screen_y.store(y,Ordering::Relaxed); self.screen_w.store(w,Ordering::Relaxed); self.screen_h.store(h,Ordering::Relaxed); }
     pub fn rect(&self)->Rect{ Rect{ x:self.screen_x.load(Ordering::Relaxed) as f64, y:self.screen_y.load(Ordering::Relaxed) as f64, w:self.screen_w.load(Ordering::Relaxed) as f64, h:self.screen_h.load(Ordering::Relaxed) as f64 } }
     pub fn edge(&self)->Edge{ Edge::from_code(self.edge_code.load(Ordering::Relaxed)) }
     pub fn set_edge(&self,e:Edge){ self.edge_code.store(e.code(),Ordering::Relaxed); }
-    /// Where the hidden ghost cursor parks while this machine drives the peer.
+    /// Where the hidden ghost cursor parks on a capture backend that cannot pin it (Windows).
+    #[cfg_attr(not(test),allow(dead_code))]
     pub fn anchor(&self)->(f64,f64){ anchor_point(self.rect(), self.edge()) }
 }
 
 #[derive(Default)]
-pub(crate) struct HookMemory { last:(f64,f64), injected:Option<(f64,f64)>, ctrl:bool, alt:bool }
+pub(crate) struct HookMemory {
+    /// Last physical pointer position; also the seed for the location fallback when a synthetic
+    /// move carries no device delta.
+    last: (f64, f64),
+    /// Last injected position, for the receiver's "the peer cursor is back on my border" test.
+    injected: Option<(f64, f64)>,
+    ctrl: bool,
+    alt: bool,
+    /// Where the local cursor is pinned while this machine drives the peer: the point it left
+    /// through, so the hand-back starts exactly where the handoff did.
+    pin: (f64, f64),
+    /// Peer cursor in normalised 0..65535 units, used only for the outward-push exit test.
+    peer: (f64, f64),
+    /// Outward travel accumulated against the border the peer cursor entered by.
+    outward: f64,
+    grace_until: Option<Instant>,
+    /// Buttons forwarded to the peer and not yet released there.
+    held: u8,
+}
+impl HookMemory {
+    pub(crate) fn pin(&self) -> (f64, f64) { self.pin }
+}
 
 /// One captured device event, in whatever form the platform's hook can supply.
 /// `Move.relative` says whether `dx`/`dy` come from the device; when they do not, the position is
@@ -83,6 +136,8 @@ pub enum Raw {
     Key { code: Key, down: bool },
     Button { button: Button, down: bool },
     Wheel { dx: i64, dy: i64 },
+    /// Anything the capture layer cannot translate; only Windows' hook produces these.
+    #[cfg_attr(target_os="macos",allow(dead_code))]
     Other,
 }
 
@@ -138,66 +193,208 @@ pub fn absolute_units(coord:f64, origin:f64, span:f64)->i32{
 /// swallows it. Both hook backends funnel into this so the handoff rules stay in one place.
 pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sender<Captured>) -> bool {
     if !state.enabled.load(Ordering::Relaxed) { return true; }
+    // On Windows the hook sees this process's own SendInput as ordinary input and only the flag
+    // can tell them apart; the macOS tap filters by source process id before calling here.
+    if state.injection.load(Ordering::Relaxed) && !matches!(raw, Raw::Move{..}) { return true; }
     if let Raw::Key{code:Key::Escape, down:true} = raw {
         if mem.ctrl && mem.alt && (state.remote.swap(false,Ordering::SeqCst)||state.receiving.swap(false,Ordering::SeqCst)) {
-            if mem.ctrl{let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(Key::ControlLeft),down:false}));}
-            if mem.alt{let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(Key::Alt),down:false}));}
-            restore_pointer(state,mem.last.0,mem.last.1);let _=tx.send(Captured::ReturnLocal);return false;
+            let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(Key::ControlLeft),down:false}));
+            let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(Key::Alt),down:false}));
+            state.block_entry(EXIT_COOLDOWN);
+            restore_pointer(state,mem.last.0,mem.last.1);
+            let _=tx.send(Captured::ReturnLocal);
+            return false;
         }
     }
     match raw {
-        Raw::Key{code:Key::ControlLeft|Key::ControlRight, down} => mem.ctrl=down,
-        Raw::Key{code:Key::Alt|Key::AltGr, down} => mem.alt=down,
-        Raw::Move{x,y,dx,dy,relative} => {
-            let edge=state.edge();
-            let r=state.rect();
-            let (lo,hi)=(r.lo(edge.vertical()),r.hi(edge.vertical()));
-            let low=edge.low();
-            if state.injection.load(Ordering::Relaxed) {
-                if state.receiving.load(Ordering::Relaxed) {
-                    // Control returns at the border facing the driver, and only when an injected move
-                    // pushes the cursor there. One already resting on that border must not bounce
-                    // control back on the next unrelated move, or the wheel would stay on this machine.
-                    let arrived=mem.injected.is_some_and(|p|!entry_crossed(edge.coord(p.0,p.1),lo,hi,low));
-                    if arrived && entry_crossed(edge.coord(x,y),lo,hi,low) { state.receiving.store(false,Ordering::SeqCst); let _=tx.send(Captured::ReturnLocal); }
-                    mem.injected=Some((x,y));
-                } else {
-                    // A local warp is not the peer's cursor, so it must not seed the next session.
-                    mem.injected=None;
-                }
-                return true;
+        Raw::Move{x,y,dx,dy,relative} => move_event(x,y,dx,dy,relative,state,mem,tx),
+        Raw::Key{code,down} => {
+            if matches!(code,Key::ControlLeft|Key::ControlRight) { mem.ctrl=down; }
+            if matches!(code,Key::Alt|Key::AltGr) { mem.alt=down; }
+            if state.remote.load(Ordering::Relaxed) {
+                let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(code),down}));
+                return false;
             }
             if state.receiving.load(Ordering::Relaxed) { return false; }
-            let remote=state.remote.load(Ordering::Relaxed);
-            // While driving the peer the position is a virtual accumulator fed by device deltas, so
-            // a border that clamps the real cursor cannot stall the peer cursor.
-            let (x,y)=if remote && relative {(mem.last.0+dx,mem.last.1+dy)} else {(x,y)};
-            if !remote && entry_crossed(edge.coord(x,y),lo,hi,low) {
-                state.remote.store(true,Ordering::SeqCst);
-                let (ax,ay)=state.anchor();
-                hide_pointer(state);mem.last=(ax,ay);warp_pointer(state,ax,ay);
-                let _=tx.send(Captured::EnterRemote);return false;
-            }
-            if remote {
-                if return_reached(edge.coord(x,y),lo,hi,low) { state.remote.store(false,Ordering::SeqCst);restore_pointer(state,x,y);let _=tx.send(Captured::ReturnLocal);return false; }
-                let fdx=x-mem.last.0;let fdy=y-mem.last.1;
-                if fdx!=0.0||fdy!=0.0 {let _=tx.send(Captured::Event(InputEvent::Move{dx:fdx,dy:fdy}));}
-                mem.last = match reanchor(x,y,r,edge) {
-                    Some(target) => { if !relative { warp_pointer(state,target.0,target.1); } target }
-                    None => (x,y),
-                };
-                return true;
-            }
-            mem.last=(x,y);
+            true
         }
-        _ if state.injection.load(Ordering::Relaxed) => return true,
-        Raw::Key{..} | Raw::Button{..} | Raw::Wheel{..} if state.receiving.load(Ordering::Relaxed) => return false,
-        Raw::Key{code,down} if state.remote.load(Ordering::Relaxed)=>{let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(code),down}));return false;}
-        Raw::Button{button,down} if state.remote.load(Ordering::Relaxed)=>{if let Some(b)=to_wire_button(button){let _=tx.send(Captured::Event(InputEvent::Button{button:b,down}));}return false;}
-        Raw::Wheel{dx,dy} if state.remote.load(Ordering::Relaxed)=>{let _=tx.send(Captured::Event(InputEvent::Wheel{dx,dy}));return false;}
-        _=>{}
+        Raw::Button{button,down} => {
+            if state.remote.load(Ordering::Relaxed) {
+                let flag=button_flag(button);
+                if down { mem.held|=flag; } else { mem.held&=!flag; }
+                if let Some(b)=to_wire_button(button){let _=tx.send(Captured::Event(InputEvent::Button{button:b,down}));}
+                return false;
+            }
+            if state.receiving.load(Ordering::Relaxed) { return false; }
+            true
+        }
+        Raw::Wheel{dx,dy} => {
+            if state.remote.load(Ordering::Relaxed) {
+                let _=tx.send(Captured::Event(InputEvent::Wheel{dx,dy}));
+                return false;
+            }
+            if state.receiving.load(Ordering::Relaxed) { return false; }
+            true
+        }
+        Raw::Other => true,
+    }
+}
+
+fn button_flag(b:Button)->u8{match b{Button::Left=>1,Button::Right=>2,Button::Middle=>4,_=>0}}
+
+fn move_event(x:f64,y:f64,dx:f64,dy:f64,relative:bool,state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>)->bool{
+    let edge=state.edge();
+    let r=state.rect();
+    let (lo,hi)=(r.lo(edge.vertical()),r.hi(edge.vertical()));
+    let low=edge.low();
+
+    if state.injection.load(Ordering::Relaxed) {
+        if state.receiving.load(Ordering::Relaxed) { receiver_move(x,y,mem,edge,lo,hi,low,state,tx); }
+        else { mem.injected=None; }   // a local warp is not the peer's cursor
+        return true;
+    }
+    if state.receiving.load(Ordering::Relaxed) { return false; }
+
+    if !state.remote.load(Ordering::Relaxed) {
+        let at_edge=entry_crossed(edge.coord(x,y),lo,hi,low);
+        let now=now_ms();
+        let blocked_until=state.entry_blocked_until.load(Ordering::Relaxed);
+        // The push that handed control back usually leaves the pointer parked on the border. Arm
+        // the border again only once the pointer has left it, or once a short stop has lapsed so a
+        // pointer parked there on purpose cannot block the handoff for ever.
+        if state.entry_rearm.load(Ordering::Relaxed) && (!at_edge || now>=blocked_until+REARM_DELAY.as_millis() as u64) {
+            state.entry_rearm.store(false,Ordering::Relaxed);
+        }
+        let armed=!state.entry_rearm.load(Ordering::Relaxed) && now>=blocked_until;
+        mem.last=(x,y);
+        if at_edge && armed { enter_remote(x,y,r,edge,state,mem,tx); }
+        return true;
+    }
+
+    // Driving the peer. The local cursor is pinned at the border it left through, so its position
+    // stops being a signal: the device delta is the travel.
+    let travelled=(x-mem.last.0,y-mem.last.1);
+    mem.last=(x,y);
+    let (mx,my)=if relative && (dx!=0.0||dy!=0.0) {(dx,dy)} else {travelled};
+    if mx!=0.0||my!=0.0 { let _=tx.send(Captured::Event(InputEvent::Move{dx:mx,dy:my})); }
+
+    // Mirror the peer cursor in normalised units so the exit test does not depend on either
+    // desktop's size.
+    let (sx,sy)=(65535.0/r.w.max(1.0),65535.0/r.h.max(1.0));
+    mem.peer.0=(mem.peer.0+mx*sx).clamp(0.0,65535.0);
+    mem.peer.1=(mem.peer.1+my*sy).clamp(0.0,65535.0);
+
+    if !relative {
+        // Absolute capture (rdev's Windows hook) reports where the pointer is rather than how far
+        // it moved, and it can travel to the far border, so reaching that border is the return
+        // gesture. Near an obstacle border the ghost cursor is pulled back inside to keep deltas
+        // flowing; the handoff border is where control would be handed back, so it is excluded.
+        if return_reached(edge.coord(x,y),lo,hi,low) {
+            leave_remote(state,mem,tx);
+            restore_pointer(state,x,y);
+            return false;
+        }
+        if let Some(target)=reanchor(x,y,r,edge) { warp_pointer(state,target.0,target.1); mem.last=target; }
+        return true;
+    }
+
+    // The peer cursor cannot pass the border it entered by, so travel that keeps pushing against
+    // that border is the user asking for control back. Requires the peer cursor to be *at* the
+    // border: merely moving towards it is still ordinary travel.
+    let outward=match edge{Edge::Right=>-mx*sx,Edge::Left=>mx*sx,Edge::Top=>my*sy,Edge::Bottom=>-my*sy};
+    let at_border=match edge{Edge::Right=>mem.peer.0<=0.0,Edge::Left=>mem.peer.0>=65535.0,Edge::Top=>mem.peer.1>=65535.0,Edge::Bottom=>mem.peer.1<=0.0};
+    if at_border && outward>0.0 { mem.outward+=outward; } else { mem.outward=0.0; }
+    let past_grace=mem.grace_until.map_or(true,|t| Instant::now()>=t);
+    // A held button means a drag or a selection is in progress; yanking control out of it is worse
+    // than making the user release first.
+    if past_grace && mem.held==0 && mem.outward>EXIT_OUTWARD {
+        leave_remote(state,mem,tx);
+        let (px,py)=mem.pin;
+        restore_pointer(state,px,py);
     }
     true
+}
+
+/// Where the peer cursor appears when the pointer leaves through `edge`, in normalised units:
+/// always the peer border that faces this machine.
+fn peer_entry(x:f64,y:f64,r:Rect,edge:Edge)->(f64,f64){
+    let nx=((x-r.x)/r.w.max(1.0)*65535.0).clamp(0.0,65535.0);
+    let ny=((y-r.y)/r.h.max(1.0)*65535.0).clamp(0.0,65535.0);
+    match edge{Edge::Right=>(0.0,ny),Edge::Left=>(65535.0,ny),Edge::Top=>(nx,65535.0),Edge::Bottom=>(nx,0.0)}
+}
+
+/// The receiving half of `peer_entry`: normalised units back to a point on this desktop. Both ends
+/// map onto their own union rect, so the entry land on the facing border of either screen size.
+pub fn normalized_point(x:f64,y:f64,r:Rect)->(f64,f64){
+    (r.x+(x/65535.0)*(r.w-1.0).max(0.0), r.y+(y/65535.0)*(r.h-1.0).max(0.0))
+}
+
+fn enter_remote(x:f64,y:f64,r:Rect,edge:Edge,state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>){
+    let vertical=edge.vertical();
+    let border=if edge.low(){r.lo(vertical)+1.0}else{r.hi(vertical)-1.0};
+    let pin=if vertical {(x.clamp(r.x,r.hi(false)-1.0),border)} else {(border,y.clamp(r.y,r.hi(true)-1.0))};
+    mem.pin=pin;
+    mem.peer=peer_entry(x,y,r,edge);
+    mem.outward=0.0;
+    mem.held=0;
+    mem.grace_until=Some(Instant::now()+ENTRY_GRACE);
+    mem.last=pin;
+    state.remote.store(true,Ordering::SeqCst);
+    state.entry_blocked_until.store(0,Ordering::SeqCst);
+    state.entry_rearm.store(false,Ordering::SeqCst);
+    let _=tx.send(Captured::EnterRemote);
+    // The peer starts where the cursor entered, not in the middle of its desktop: otherwise the
+    // first push inward would have to cross half the peer screen before it could come back.
+    let _=tx.send(Captured::Event(InputEvent::MoveTo{x:mem.peer.0,y:mem.peer.1}));
+    hide_pointer(state);
+    warp_pointer(state,pin.0,pin.1);
+}
+
+fn leave_remote(state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>){
+    state.remote.store(false,Ordering::SeqCst);
+    state.block_entry(EXIT_COOLDOWN);
+    mem.outward=0.0;
+    // Release on the peer what is still held here, or it stays stuck in a drag after hand-back.
+    for button in [Button::Left,Button::Right,Button::Middle] {
+        if mem.held & button_flag(button) != 0 {
+            if let Some(b)=to_wire_button(button){let _=tx.send(Captured::Event(InputEvent::Button{button:b,down:false}));}
+        }
+    }
+    mem.held=0;
+    let _=tx.send(Captured::ReturnLocal);
+}
+
+/// Receiver-side bookkeeping for a move this process injected on the peer's behalf: control is
+/// released once the peer cursor comes back to the border that faces the driver. One already
+/// resting on that border must not bounce control back on the next unrelated move.
+fn receiver_move(x:f64,y:f64,mem:&mut HookMemory,edge:Edge,lo:f64,hi:f64,low:bool,state:&HookState,tx:&Sender<Captured>){
+    let arrived=mem.injected.is_some_and(|p|!entry_crossed(edge.coord(p.0,p.1),lo,hi,low));
+    if arrived && entry_crossed(edge.coord(x,y),lo,hi,low) {
+        state.receiving.store(false,Ordering::SeqCst);
+        state.block_entry(EXIT_COOLDOWN);
+        let _=tx.send(Captured::ReturnLocal);
+    }
+    mem.injected=Some((x,y));
+}
+
+/// Filters the events this process injected itself. The macOS tap recognises them by source
+/// process id, which no timing race can defeat, so they do not go through `handle`.
+pub(crate) fn handle_injected(raw:&Raw,state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>){
+    let Raw::Move{x,y,..}=raw else { return; };
+    let edge=state.edge();
+    let r=state.rect();
+    let (lo,hi)=(r.lo(edge.vertical()),r.hi(edge.vertical()));
+    if state.receiving.load(Ordering::Relaxed) { receiver_move(*x,*y,mem,edge,lo,hi,edge.low(),state,tx); }
+    else { mem.injected=None; }
+}
+
+/// Hands control back unconditionally: the link died, the user switched the edge off, or the peer
+/// asked for it. The pointer is shown, re-associated and parked inside the border.
+pub fn force_return(state:&HookState){
+    state.remote.store(false,Ordering::SeqCst);
+    state.receiving.store(false,Ordering::SeqCst);
+    state.block_entry(EXIT_COOLDOWN);
+    restore_pointer(state,0.0,0.0);
 }
 
 /// Runs a suppressing system-wide hook. Call on a dedicated thread; macOS asks the
@@ -247,6 +444,13 @@ fn wheel_units(ticks:i64, carry:&mut f64)->i64{
 
 /// Marks the whole injection as ours so the hook ignores the resulting event, and keeps the flag up
 /// long enough for the event to come back through the hook.
+///
+/// The macOS tap does not need the flag: it recognises its own injections by source process id,
+/// and sleeping here would stall that tap's callback, which is where the handoff logic runs — a
+/// stalled callback is what makes the system disable the tap.
+#[cfg(target_os="macos")]
+fn guarded<T>(_state:&HookState, post:impl FnOnce()->T)->T{ post() }
+#[cfg(not(target_os="macos"))]
 fn guarded<T>(state:&HookState, post:impl FnOnce()->T)->T{
     state.injection.store(true,Ordering::SeqCst);
     let out=post();
@@ -261,6 +465,15 @@ pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result
         InputEvent::Move{dx,dy}=>{
             inj.cursor.0=clamp_move(inj.cursor.0,*dx,r.x,r.hi(false));
             inj.cursor.1=clamp_move(inj.cursor.1,*dy,r.y,r.hi(true));
+            #[cfg(target_os="windows")]
+            return guarded(state,||platform_move(inj.cursor,r));
+            #[cfg(not(target_os="windows"))]
+            EventType::MouseMove{x:inj.cursor.0,y:inj.cursor.1}
+        },
+        // The peer's entry point: the driver cannot know this desktop's size, so it sends the
+        // border it wants the cursor to appear on rather than a delta.
+        InputEvent::MoveTo{x,y}=>{
+            inj.cursor=normalized_point(*x,*y,r);
             #[cfg(target_os="windows")]
             return guarded(state,||platform_move(inj.cursor,r));
             #[cfg(not(target_os="windows"))]
@@ -283,19 +496,30 @@ fn parse_key(s:&str)->Option<Key>{Some(match s{
 pub fn release_key(code:&str)->Result<(),String>{if let Some(k)=parse_key(code){simulate(&EventType::KeyRelease(k)).map_err(|e|format!("release key failed: {e:?}"))?;}Ok(())}
 pub fn release_button(button:MouseButton)->Result<(),String>{let b=match button{MouseButton::Left=>Button::Left,MouseButton::Right=>Button::Right,MouseButton::Middle=>Button::Middle};simulate(&EventType::ButtonRelease(b)).map_err(|e|format!("release mouse button failed: {e:?}"))}
 
-fn hide_pointer(state:&HookState){if !state.cursor_hidden.swap(true,Ordering::SeqCst){platform_hide();}}
-pub fn restore_pointer(state:&HookState,x:f64,y:f64){if state.cursor_hidden.swap(false,Ordering::SeqCst){platform_show();let edge=state.edge();let r=state.rect();let v=edge.vertical();let inside=if edge.low(){r.lo(v)+3.0}else{r.hi(v)-3.0};let (rx,ry)=if v{(x.clamp(r.x,r.hi(false)-1.0),inside)}else{(inside,y.clamp(r.y,r.hi(true)-1.0))};warp_pointer(state,rx,ry);}}
-fn warp_pointer(state:&HookState,x:f64,y:f64){guarded(state,||platform_warp(x,y,state.rect()));}
+/// The unit tests run this state machine on the developer's own desktop, so they must never move
+/// or hide the real pointer; the end-to-end check exercises the built binary instead.
+fn quiet()->bool{cfg!(test)}
+
+fn hide_pointer(state:&HookState){if !state.cursor_hidden.swap(true,Ordering::SeqCst)&&!quiet(){platform_hide();}}
+pub fn restore_pointer(state:&HookState,x:f64,y:f64){
+    if !state.cursor_hidden.swap(false,Ordering::SeqCst)||quiet(){return;}
+    platform_show();
+    let edge=state.edge();
+    let r=state.rect();
+    let v=edge.vertical();
+    let inside=if edge.low(){r.lo(v)+3.0}else{r.hi(v)-3.0};
+    let (rx,ry)=if v{(x.clamp(r.x,r.hi(false)-1.0),inside)}else{(inside,y.clamp(r.y,r.hi(true)-1.0))};
+    warp_pointer(state,rx,ry);
+}
+fn warp_pointer(state:&HookState,x:f64,y:f64){if !quiet(){guarded(state,||platform_warp(x,y,state.rect()));}}
 #[cfg(target_os="macos")]
 fn platform_warp(x:f64,y:f64,_r:Rect){#[repr(C)]struct Point{x:f64,y:f64}#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGWarpMouseCursorPosition(p:Point)->i32;}unsafe{let _=CGWarpMouseCursorPosition(Point{x,y});}}
-/// The cursor hide counter is per display: hiding only the main one leaves the ghost cursor visible
-/// on every other screen of a multi-monitor desktop.
+/// Hiding, showing and re-associating the cursor are one concern with one counter, so macOS keeps
+/// them in the capture layer where the per-event re-assert lives.
 #[cfg(target_os="macos")]
-fn display_ids()->Vec<u32>{#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGGetActiveDisplayList(max:u32,ids:*mut u32,count:*mut u32)->i32;fn CGMainDisplayID()->u32;}let mut ids=[0u32;16];let mut count=0u32;if unsafe{CGGetActiveDisplayList(ids.len() as u32,ids.as_mut_ptr(),&mut count)}!=0||count==0{return vec![unsafe{CGMainDisplayID()}];}ids[..count as usize].to_vec()}
+fn platform_hide(){crate::tap::lock_cursor();}
 #[cfg(target_os="macos")]
-fn platform_hide(){#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGDisplayHideCursor(id:u32)->i32;}for id in display_ids(){unsafe{let _=CGDisplayHideCursor(id);}}}
-#[cfg(target_os="macos")]
-fn platform_show(){#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGDisplayShowCursor(id:u32)->i32;}for id in display_ids(){unsafe{let _=CGDisplayShowCursor(id);}}}
+fn platform_show(){crate::tap::unlock_cursor();}
 #[cfg(target_os="windows")]
 fn platform_warp(x:f64,y:f64,r:Rect){let _=platform_move((x,y),r);}
 /// Only mouse input is ever posted, so the INPUT union can be spelled as its largest member.
@@ -556,5 +780,204 @@ mod tests {
         assert!(injected(&state,&mut mem,&tx,400.0));
         assert!(injected(&state,&mut mem,&tx,1.0));
         assert!(matches!(rx.try_recv(),Ok(Captured::ReturnLocal)));
+    }
+
+    fn travelled(state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>,x:f64,y:f64,dx:f64,dy:f64)->bool{
+        handle(Raw::Move{x,y,dx,dy,relative:true},state,mem,tx)
+    }
+    fn taken(rx:&std::sync::mpsc::Receiver<Captured>)->Vec<Captured>{
+        let mut out=Vec::new();
+        while let Ok(m)=rx.try_recv(){out.push(m);}
+        out
+    }
+    fn entered(rx:&std::sync::mpsc::Receiver<Captured>)->bool{
+        taken(rx).iter().any(|m|matches!(m,Captured::EnterRemote))
+    }
+    fn forwarded_move(rx:&std::sync::mpsc::Receiver<Captured>)->Option<(f64,f64)>{
+        taken(rx).into_iter().find_map(|m|match m{Captured::Event(InputEvent::Move{dx,dy})=>Some((dx,dy)),_=>None})
+    }
+    fn is_remote(state:&HookState)->bool{state.remote.load(Ordering::SeqCst)}
+
+    /// Device travel that carries the peer cursor deeper into the peer desktop. Small enough that a
+    /// single frame on either axis stays under the exit threshold.
+    fn inward(edge:Edge)->(f64,f64){
+        match edge{Edge::Right=>(15.0,0.0),Edge::Left=>(-15.0,0.0),Edge::Top=>(0.0,-15.0),Edge::Bottom=>(0.0,15.0)}
+    }
+
+    /// Walks the pointer onto the handoff border from the middle of the desktop.
+    fn cross_out(state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>,r:Rect,edge:Edge){
+        let (x,y)=match edge{
+            Edge::Right=>(r.hi(false)-1.0,r.y+r.h*0.5),
+            Edge::Left=>(r.x+1.0,r.y+r.h*0.5),
+            Edge::Top=>(r.x+r.w*0.5,r.y+1.0),
+            Edge::Bottom=>(r.x+r.w*0.5,r.hi(true)-1.0),
+        };
+        assert!(travelled(state,mem,tx,x,y,0.0,0.0),"the captured move must still reach this machine");
+        assert!(is_remote(state),"walking onto the {edge:?} border must hand control over");
+    }
+
+    #[test]
+    fn entering_pins_the_local_cursor_and_places_the_peer_cursor_on_its_facing_border() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        assert_eq!(mem.pin(),(1919.0,540.0),"the local cursor must stay where it left through");
+        assert!(state.cursor_hidden.load(Ordering::SeqCst));
+        let msgs=taken(&rx);
+        assert!(matches!(msgs[0],Captured::EnterRemote),"the link must be told control moved");
+        let entry=msgs.iter().find_map(|m|match m{Captured::Event(InputEvent::MoveTo{x,y})=>Some((*x,*y)),_=>None});
+        assert_eq!(entry,Some((0.0,32767.5)),"the peer cursor must start on the border facing this machine, not in the middle");
+        assert_eq!(state.entry_blocked_until.load(Ordering::Relaxed),0,"entering is not itself blocked");
+    }
+
+    #[test]
+    fn every_edge_lands_the_peer_cursor_on_the_matching_border() {
+        for edge in [Edge::Right,Edge::Left,Edge::Top,Edge::Bottom] {
+            for r in [SCREEN,DUAL] {
+                let (px,py)=peer_entry(r.x+r.w*0.25,r.y+r.h*0.75,r,edge);
+                match edge {
+                    Edge::Right=>assert_eq!(px,0.0),
+                    Edge::Left=>assert_eq!(px,65535.0),
+                    Edge::Top=>assert_eq!(py,65535.0),
+                    Edge::Bottom=>assert_eq!(py,0.0),
+                }
+                // Back on the receiving end the point must sit on that same border of its own desktop.
+                let (rx,ry)=normalized_point(px,py,r);
+                let (cx,cy)=(r.x+r.w*0.25,r.y+r.h*0.75);
+                match edge {
+                    Edge::Right|Edge::Left => {
+                        let facing=if edge==Edge::Right {r.x} else {r.hi(false)-1.0};
+                        assert!((rx-facing).abs()<1.5,"{edge:?} {r:?} x={rx} must land on {facing}");
+                        assert!((ry-cy).abs()<2.0,"{edge:?} {r:?} y={ry} must keep the crossing height");
+                    }
+                    Edge::Top|Edge::Bottom => {
+                        let facing=if edge==Edge::Bottom {r.y} else {r.hi(true)-1.0};
+                        assert!((ry-facing).abs()<1.5,"{edge:?} {r:?} y={ry} must land on {facing}");
+                        assert!((rx-cx).abs()<2.0,"{edge:?} {r:?} x={rx} must keep the crossing column");
+                    }
+                }
+            }
+        }
+        assert_eq!(normalized_point(0.0,0.0,SCREEN),(0.0,0.0));
+        assert_eq!(normalized_point(65535.0,65535.0,SCREEN),(1919.0,1079.0));
+        assert_eq!(normalized_point(0.0,0.0,DUAL),(DUAL.x,DUAL.y));
+        assert_eq!(normalized_point(65535.0,65535.0,DUAL),(1919.0,1079.0));
+        assert_eq!(normalized_point(500.0,500.0,Rect::default()),(0.0,0.0));
+    }
+
+    #[test]
+    fn the_peer_moves_by_the_device_delta_while_the_local_cursor_is_pinned() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        taken(&rx);
+        // Position stays on the pin, so only the device delta can carry the travel.
+        assert!(travelled(&state,&mut mem,&tx,1919.0,540.0,-25.0,15.0));
+        assert_eq!(forwarded_move(&rx),Some((-25.0,15.0)));
+        assert!(travelled(&state,&mut mem,&tx,1919.0,540.0,-10.0,0.0));
+        assert_eq!(forwarded_move(&rx),Some((-10.0,0.0)));
+        assert!(is_remote(&state),"ordinary inward travel must not hand control back");
+        assert!(state.cursor_hidden.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn every_edge_needs_the_push_towards_its_own_outside() {
+        for edge in [Edge::Right,Edge::Left,Edge::Top,Edge::Bottom] {
+            let (state,mut mem,tx,rx)=harness(edge,SCREEN);
+            cross_out(&state,&mut mem,&tx,SCREEN,edge);
+            taken(&rx);
+            std::thread::sleep(ENTRY_GRACE+Duration::from_millis(20));
+            let (inx,iny)=inward(edge);
+            let (outx,outy)=(-inx,-iny);
+            for _ in 0..5 { travelled(&state,&mut mem,&tx,0.0,0.0,inx,iny); }
+            assert!(is_remote(&state),"{edge:?}: walking into the peer screen must keep control");
+            // Five frames back is exactly the trip to the entry border: travel, not a push.
+            for _ in 0..5 { travelled(&state,&mut mem,&tx,0.0,0.0,outx,outy); }
+            assert!(is_remote(&state),"{edge:?}: arriving back at the entry border is still travel");
+            // Past that border the peer cursor cannot follow, so the same direction becomes the push.
+            for _ in 0..4 { travelled(&state,&mut mem,&tx,0.0,0.0,outx,outy); }
+            assert!(!is_remote(&state),"{edge:?}: pushing past the entry border must hand control back");
+        }
+    }
+
+    #[test]
+    fn the_hand_back_needs_a_sustained_outward_push_and_waits_out_the_entry_grace() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        taken(&rx);
+        // A flick straight back out right after entering is a user who overshot, not a hand-back.
+        for _ in 0..5 { travelled(&state,&mut mem,&tx,1919.0,540.0,-5.0,0.0); }
+        assert!(is_remote(&state),"the entry grace must swallow the immediate overshoot");
+        std::thread::sleep(ENTRY_GRACE+Duration::from_millis(20));
+        // Accumulated outward travel still has to cross the threshold; one frame never should.
+        for _ in 0..2 { travelled(&state,&mut mem,&tx,1919.0,540.0,-5.0,0.0); }
+        assert!(is_remote(&state),"a few points of push are just a jittery hand");
+        travelled(&state,&mut mem,&tx,1919.0,540.0,-5.0,0.0);
+        assert!(!is_remote(&state),"sustained outward push must hand control back");
+        assert!(!state.cursor_hidden.load(Ordering::SeqCst),"the local cursor must come back");
+        assert!(taken(&rx).iter().any(|m|matches!(m,Captured::ReturnLocal)));
+    }
+
+    #[test]
+    fn inward_travel_at_the_entry_border_is_not_an_outward_push() {
+        let (state,mut mem,tx,_rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        std::thread::sleep(ENTRY_GRACE+Duration::from_millis(20));
+        // The peer cursor has moved away from the border, so pushing back towards it is travel.
+        for _ in 0..15 { travelled(&state,&mut mem,&tx,1919.0,540.0,40.0,0.0); }
+        for _ in 0..10 { travelled(&state,&mut mem,&tx,1919.0,540.0,-40.0,0.0); }
+        assert!(is_remote(&state),"only travel against the border with the cursor *at* it counts");
+    }
+
+    #[test]
+    fn a_held_button_keeps_control_until_it_is_released() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        taken(&rx);
+        assert!(!handle(Raw::Button{button:Button::Left,down:true},&state,&mut mem,&tx),"a press must go to the peer, not here");
+        assert_eq!(mem.held,1);
+        assert!(taken(&rx).iter().any(|m|matches!(m,Captured::Event(InputEvent::Button{down:true,..}))));
+        std::thread::sleep(ENTRY_GRACE+Duration::from_millis(20));
+        for _ in 0..10 { travelled(&state,&mut mem,&tx,1919.0,540.0,-40.0,0.0); }
+        assert!(is_remote(&state),"a drag in progress must not be yanked back mid-stroke");
+        assert!(!handle(Raw::Button{button:Button::Left,down:false},&state,&mut mem,&tx));
+        assert_eq!(mem.held,0);
+        travelled(&state,&mut mem,&tx,1919.0,540.0,-5.0,0.0);
+        assert!(!is_remote(&state),"releasing the button must let the hand-back through");
+        assert!(taken(&rx).iter().any(|m|matches!(m,Captured::Event(InputEvent::Button{down:false,..}))));
+    }
+
+    #[test]
+    fn the_border_that_was_just_left_does_not_fire_again_straight_away() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        taken(&rx);
+        std::thread::sleep(ENTRY_GRACE+Duration::from_millis(20));
+        for _ in 0..8 { travelled(&state,&mut mem,&tx,1919.0,540.0,-5.0,0.0); }
+        assert!(!is_remote(&state));
+        taken(&rx);
+        // The momentum of the hand-back leaves the pointer on the border: no instant bounce.
+        assert!(travelled(&state,&mut mem,&tx,1919.0,540.0,0.0,0.0));
+        assert!(travelled(&state,&mut mem,&tx,1918.0,540.0,0.0,0.0));
+        assert!(!entered(&rx),"the exit cooldown must stop an immediate hand-off");
+        // Once the cooldown lapses and the pointer has left the band, the border works again.
+        std::thread::sleep(EXIT_COOLDOWN+Duration::from_millis(20));
+        travelled(&state,&mut mem,&tx,1200.0,540.0,0.0,0.0);
+        travelled(&state,&mut mem,&tx,1919.0,540.0,0.0,0.0);
+        assert!(is_remote(&state));
+    }
+
+    #[test]
+    fn the_escape_hatch_releases_both_directions_and_blocks_the_border() {
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        cross_out(&state,&mut mem,&tx,SCREEN,Edge::Right);
+        taken(&rx);
+        assert!(!handle(Raw::Key{code:Key::ControlLeft,down:true},&state,&mut mem,&tx),"keys go to the peer while it has control");
+        assert!(!handle(Raw::Key{code:Key::Alt,down:true},&state,&mut mem,&tx));
+        assert!(!handle(Raw::Key{code:Key::Escape,down:true},&state,&mut mem,&tx));
+        assert!(!is_remote(&state));
+        assert!(!state.cursor_hidden.load(Ordering::SeqCst));
+        assert!(taken(&rx).iter().any(|m|matches!(m,Captured::ReturnLocal)));
+        // The pointer is parked on the border where it left; it must not fall straight back in.
+        assert!(travelled(&state,&mut mem,&tx,1919.0,540.0,0.0,0.0));
+        assert!(!is_remote(&state));
     }
 }
