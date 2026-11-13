@@ -76,7 +76,12 @@ pub struct HookState {
     pub enabled: Arc<AtomicBool>,
     pub remote: Arc<AtomicBool>,
     pub receiving: Arc<AtomicBool>,
-    pub injection: Arc<AtomicBool>,
+    /// Let input reach the local machine while the peer drives this one. A low-level hook blocks by
+    /// returning non-zero, and this process's own SendInput output comes back through that same
+    /// hook, so a Windows receiver that blocked would drop its own frames (a stuttering pointer)
+    /// and its own wheel and keystrokes. macOS filters own injections by source process id before
+    /// the state machine sees them, so it can keep blocking stray local input there.
+    pub passthrough: Arc<AtomicBool>,
     pub cursor_hidden: Arc<AtomicBool>,
     pub edge_code: Arc<AtomicU32>,
     pub screen_x: Arc<AtomicI32>,
@@ -87,9 +92,12 @@ pub struct HookState {
     pub entry_blocked_until: Arc<AtomicU64>,
     /// Set when control was just handed back, cleared once the pointer leaves the border band.
     pub entry_rearm: Arc<AtomicBool>,
+    /// Bumped when the peer announces a fresh takeover. The receiver's memory of where the peer
+    /// cursor was belongs to the previous session and must not decide this one's hand-back.
+    pub receiving_epoch: Arc<AtomicU32>,
 }
 impl HookState {
-    pub fn new() -> Self { Self { enabled:Arc::new(AtomicBool::new(false)), remote:Arc::new(AtomicBool::new(false)), receiving:Arc::new(AtomicBool::new(false)), injection:Arc::new(AtomicBool::new(false)), cursor_hidden:Arc::new(AtomicBool::new(false)), edge_code:Arc::new(AtomicU32::new(Edge::Right.code())), screen_x:Arc::new(AtomicI32::new(0)), screen_y:Arc::new(AtomicI32::new(0)), screen_w:Arc::new(AtomicU32::new(0)), screen_h:Arc::new(AtomicU32::new(0)), entry_blocked_until:Arc::new(AtomicU64::new(0)), entry_rearm:Arc::new(AtomicBool::new(false)) } }
+    pub fn new() -> Self { Self { enabled:Arc::new(AtomicBool::new(false)), remote:Arc::new(AtomicBool::new(false)), receiving:Arc::new(AtomicBool::new(false)), passthrough:Arc::new(AtomicBool::new(cfg!(target_os="windows"))), cursor_hidden:Arc::new(AtomicBool::new(false)), edge_code:Arc::new(AtomicU32::new(Edge::Right.code())), screen_x:Arc::new(AtomicI32::new(0)), screen_y:Arc::new(AtomicI32::new(0)), screen_w:Arc::new(AtomicU32::new(0)), screen_h:Arc::new(AtomicU32::new(0)), entry_blocked_until:Arc::new(AtomicU64::new(0)), entry_rearm:Arc::new(AtomicBool::new(false)), receiving_epoch:Arc::new(AtomicU32::new(0)) } }
     /// Keeps the handoff border from firing until `d` has passed and the pointer has left the band.
     pub fn block_entry(&self, d: Duration) {
         self.entry_blocked_until.store(now_ms() + d.as_millis() as u64, Ordering::SeqCst);
@@ -111,6 +119,9 @@ pub(crate) struct HookMemory {
     last: (f64, f64),
     /// Last injected position, for the receiver's "the peer cursor is back on my border" test.
     injected: Option<(f64, f64)>,
+    /// Where the ghost cursor was just warped by this process, so the post-warp move event that
+    /// comes back through the hook is not mistaken for travel.
+    warp: Option<(f64, f64)>,
     ctrl: bool,
     alt: bool,
     /// Where the local cursor is pinned while this machine drives the peer: the point it left
@@ -118,6 +129,8 @@ pub(crate) struct HookMemory {
     pin: (f64, f64),
     /// Peer cursor in normalised 0..65535 units, used only for the outward-push exit test.
     peer: (f64, f64),
+    /// `receiving_epoch` this memory belongs to.
+    epoch: u32,
     /// Outward travel accumulated against the border the peer cursor entered by.
     outward: f64,
     grace_until: Option<Instant>,
@@ -194,9 +207,6 @@ pub fn absolute_units(coord:f64, origin:f64, span:f64)->i32{
 /// swallows it. Both hook backends funnel into this so the handoff rules stay in one place.
 pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sender<Captured>) -> bool {
     if !state.enabled.load(Ordering::Relaxed) { return true; }
-    // On Windows the hook sees this process's own SendInput as ordinary input and only the flag
-    // can tell them apart; the macOS tap filters by source process id before calling here.
-    if state.injection.load(Ordering::Relaxed) && !matches!(raw, Raw::Move{..}) { return true; }
     if let Raw::Key{code:Key::Escape, down:true} = raw {
         if mem.ctrl && mem.alt && (state.remote.swap(false,Ordering::SeqCst)||state.receiving.swap(false,Ordering::SeqCst)) {
             let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(Key::ControlLeft),down:false}));
@@ -216,7 +226,7 @@ pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sen
                 let _=tx.send(Captured::Event(InputEvent::Key{code:key_name(code),down}));
                 return false;
             }
-            if state.receiving.load(Ordering::Relaxed) { return false; }
+            if state.receiving.load(Ordering::Relaxed) { return state.passthrough.load(Ordering::Relaxed); }
             true
         }
         Raw::Button{button,down} => {
@@ -226,7 +236,7 @@ pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sen
                 if let Some(b)=to_wire_button(button){let _=tx.send(Captured::Event(InputEvent::Button{button:b,down}));}
                 return false;
             }
-            if state.receiving.load(Ordering::Relaxed) { return false; }
+            if state.receiving.load(Ordering::Relaxed) { return state.passthrough.load(Ordering::Relaxed); }
             true
         }
         Raw::Wheel{dx,dy} => {
@@ -234,7 +244,7 @@ pub(crate) fn handle(raw: Raw, state: &HookState, mem: &mut HookMemory, tx: &Sen
                 let _=tx.send(Captured::Event(InputEvent::Wheel{dx,dy}));
                 return false;
             }
-            if state.receiving.load(Ordering::Relaxed) { return false; }
+            if state.receiving.load(Ordering::Relaxed) { return state.passthrough.load(Ordering::Relaxed); }
             true
         }
         Raw::Other => true,
@@ -249,12 +259,25 @@ fn move_event(x:f64,y:f64,dx:f64,dy:f64,relative:bool,state:&HookState,mem:&mut 
     let (lo,hi)=(r.lo(edge.vertical()),r.hi(edge.vertical()));
     let low=edge.low();
 
-    if state.injection.load(Ordering::Relaxed) {
-        if state.receiving.load(Ordering::Relaxed) { receiver_move(x,y,mem,edge,lo,hi,low,state,tx); }
-        else { mem.injected=None; }   // a local warp is not the peer's cursor
-        return true;
+    if state.receiving.load(Ordering::Relaxed) {
+        // The peer is moving this pointer; nothing here is local input. On Windows the event still
+        // has to go through, or the OS would drop the peer's own injected frame, and that is the
+        // only case in which this hook sees injected moves at all (macOS filters them by pid and
+        // does the same bookkeeping in `handle_injected`).
+        let passthrough = state.passthrough.load(Ordering::Relaxed);
+        if passthrough {
+            let epoch = state.receiving_epoch.load(Ordering::Relaxed);
+            if mem.epoch != epoch { mem.epoch = epoch; mem.injected = None; }
+            receiver_move(x,y,mem,edge,lo,hi,low,state,tx);
+        }
+        return passthrough;
     }
-    if state.receiving.load(Ordering::Relaxed) { return false; }
+    // A warp this process posted to pull the ghost cursor back inside an obstacle border comes
+    // straight back through the hook. It is not travel; forwarding it would teleport the peer
+    // cursor. Matched by position because SendInput is asynchronous and a timer cannot span it.
+    if let Some(target)=mem.warp.take() {
+        if (x-target.0).abs()<=3.0 && (y-target.1).abs()<=3.0 { mem.last=(x,y); return true; }
+    }
 
     if !state.remote.load(Ordering::Relaxed) {
         let at_edge=entry_crossed(edge.coord(x,y),lo,hi,low);
@@ -295,7 +318,7 @@ fn move_event(x:f64,y:f64,dx:f64,dy:f64,relative:bool,state:&HookState,mem:&mut 
             restore_pointer(state,x,y);
             return false;
         }
-        if let Some(target)=reanchor(x,y,r,edge) { warp_pointer(state,target.0,target.1); mem.last=target; }
+        if let Some(target)=reanchor(x,y,r,edge) { mem.warp=Some(target); warp_pointer(state,target.0,target.1); mem.last=target; }
         return true;
     }
 
@@ -385,8 +408,11 @@ pub(crate) fn handle_injected(raw:&Raw,state:&HookState,mem:&mut HookMemory,tx:&
     let edge=state.edge();
     let r=state.rect();
     let (lo,hi)=(r.lo(edge.vertical()),r.hi(edge.vertical()));
-    if state.receiving.load(Ordering::Relaxed) { receiver_move(*x,*y,mem,edge,lo,hi,edge.low(),state,tx); }
-    else { mem.injected=None; }
+    if state.receiving.load(Ordering::Relaxed) {
+        let epoch = state.receiving_epoch.load(Ordering::Relaxed);
+        if mem.epoch != epoch { mem.epoch = epoch; mem.injected = None; }
+        receiver_move(*x,*y,mem,edge,lo,hi,edge.low(),state,tx);
+    } else { mem.injected=None; }
 }
 
 /// Hands control back unconditionally: the link died, the user switched the edge off, or the peer
@@ -443,23 +469,12 @@ fn wheel_units(ticks:i64, carry:&mut f64)->i64{
     whole as i64
 }
 
-/// Marks the whole injection as ours so the hook ignores the resulting event, and keeps the flag up
-/// long enough for the event to come back through the hook.
-///
-/// The macOS tap does not need the flag: it recognises its own injections by source process id,
-/// and sleeping here would stall that tap's callback, which is where the handoff logic runs — a
-/// stalled callback is what makes the system disable the tap.
-#[cfg(target_os="macos")]
-fn guarded<T>(_state:&HookState, post:impl FnOnce()->T)->T{ post() }
-#[cfg(not(target_os="macos"))]
-fn guarded<T>(state:&HookState, post:impl FnOnce()->T)->T{
-    state.injection.store(true,Ordering::SeqCst);
-    let out=post();
-    std::thread::sleep(Duration::from_millis(3));
-    state.injection.store(false,Ordering::SeqCst);
-    out
-}
-
+/// Injection no longer needs to be flagged. A fixed-delay "this came from us" flag raced the
+/// asynchronous low-level hook — events that arrived late were treated as local input and blocked,
+/// which is exactly what made the driven cursor stutter and ate its wheel and keystrokes — and the
+/// 3 ms wait that was supposed to cover the race capped injection at a few hundred events a second.
+/// Receivers now let their own hook output through while `passthrough` is set, and the driver-side
+/// warp is matched by position in `move_event`.
 pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result<(),String>{
     let r=state.rect();
     let native=match event {
@@ -467,7 +482,7 @@ pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result
             inj.cursor.0=clamp_move(inj.cursor.0,*dx,r.x,r.hi(false));
             inj.cursor.1=clamp_move(inj.cursor.1,*dy,r.y,r.hi(true));
             #[cfg(target_os="windows")]
-            return guarded(state,||platform_move(inj.cursor,r));
+            return platform_move(inj.cursor,r);
             #[cfg(not(target_os="windows"))]
             EventType::MouseMove{x:inj.cursor.0,y:inj.cursor.1}
         },
@@ -476,7 +491,7 @@ pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result
         InputEvent::MoveTo{x,y}=>{
             inj.cursor=normalized_point(*x,*y,r);
             #[cfg(target_os="windows")]
-            return guarded(state,||platform_move(inj.cursor,r));
+            return platform_move(inj.cursor,r);
             #[cfg(not(target_os="windows"))]
             EventType::MouseMove{x:inj.cursor.0,y:inj.cursor.1}
         },
@@ -484,7 +499,7 @@ pub fn inject(event:&InputEvent, inj:&mut InjectState, state:&HookState)->Result
         InputEvent::Wheel{dx,dy}=>EventType::Wheel{delta_x:wheel_units(*dx,&mut inj.wheel.0),delta_y:wheel_units(*dy,&mut inj.wheel.1)},
         InputEvent::Key{code,down}=>{let Some(k)=parse_key(code) else{return Ok(())};if *down{EventType::KeyPress(k)}else{EventType::KeyRelease(k)}},
     };
-    guarded(state,||simulate(&native).map_err(|e|format!("input injection failed: {e:?}")))
+    simulate(&native).map_err(|e|format!("input injection failed: {e:?}"))
 }
 
 /// Key names on the wire are rdev's own variant spellings; `parse_key` is the accepting half.
@@ -512,7 +527,7 @@ pub fn restore_pointer(state:&HookState,x:f64,y:f64){
     let (rx,ry)=if v{(x.clamp(r.x,r.hi(false)-1.0),inside)}else{(inside,y.clamp(r.y,r.hi(true)-1.0))};
     warp_pointer(state,rx,ry);
 }
-fn warp_pointer(state:&HookState,x:f64,y:f64){if !quiet(){guarded(state,||platform_warp(x,y,state.rect()));}}
+fn warp_pointer(state:&HookState,x:f64,y:f64){if !quiet(){platform_warp(x,y,state.rect());}}
 #[cfg(target_os="macos")]
 fn platform_warp(x:f64,y:f64,_r:Rect){#[repr(C)]struct Point{x:f64,y:f64}#[link(name="CoreGraphics",kind="framework")]unsafe extern "C"{fn CGWarpMouseCursorPosition(p:Point)->i32;}unsafe{let _=CGWarpMouseCursorPosition(Point{x,y});}}
 /// Hiding, showing and re-associating the cursor are one concern with one counter, so macOS keeps
@@ -732,8 +747,9 @@ mod tests {
         assert!(matches!(rx.try_recv(),Ok(Captured::Event(InputEvent::Wheel{dx:0,dy:-120}))));
         state.remote.store(false,Ordering::SeqCst);
         state.receiving.store(true,Ordering::SeqCst);
-        assert!(!handle(Raw::Wheel{dx:0,dy:WHEEL_TICKS_PER_NOTCH},&state,&mut mem,&tx),"while being driven the local wheel is dropped");
-        assert!(rx.try_recv().is_err());
+        state.passthrough.store(true,Ordering::SeqCst);
+        assert!(handle(Raw::Wheel{dx:0,dy:WHEEL_TICKS_PER_NOTCH},&state,&mut mem,&tx),"a Windows receiver must let the peer's wheel through");
+        assert!(rx.try_recv().is_err(),"and it must not be treated as local control");
     }
 
     #[test]
@@ -761,7 +777,7 @@ mod tests {
         // the injected cursor reaches whenever the user simply keeps moving right.
         let (state,mut mem,tx,rx)=harness(Edge::Left,SCREEN);
         state.receiving.store(true,Ordering::SeqCst);
-        state.injection.store(true,Ordering::SeqCst);
+        state.passthrough.store(true,Ordering::SeqCst);
         assert!(injected(&state,&mut mem,&tx,960.0));
         assert!(injected(&state,&mut mem,&tx,1919.0));
         assert!(rx.try_recv().is_err(),"the far border must not hand control back");
@@ -775,12 +791,53 @@ mod tests {
     fn a_cursor_resting_on_the_handback_border_does_not_bounce_control() {
         let (state,mut mem,tx,rx)=harness(Edge::Left,SCREEN);
         state.receiving.store(true,Ordering::SeqCst);
-        state.injection.store(true,Ordering::SeqCst);
+        state.passthrough.store(true,Ordering::SeqCst);
         assert!(injected(&state,&mut mem,&tx,0.0));
         assert!(rx.try_recv().is_err(),"the first move after a hand-back must not hand straight back");
         assert!(injected(&state,&mut mem,&tx,400.0));
         assert!(injected(&state,&mut mem,&tx,1.0));
         assert!(matches!(rx.try_recv(),Ok(Captured::ReturnLocal)));
+    }
+
+    #[test]
+    fn a_mac_receiver_still_blocks_input_it_is_not_driving_with() {
+        // macOS recognises its own injections by source process id, so the only events that reach
+        // the state machine while receiving are physical ones, and those must not disturb the user.
+        let (state,mut mem,tx,rx)=harness(Edge::Left,SCREEN);
+        state.receiving.store(true,Ordering::SeqCst);
+        assert!(!handle(Raw::Key{code:Key::KeyA,down:true},&state,&mut mem,&tx));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_new_takeover_forgets_where_the_previous_one_ended() {
+        // The previous session may have ended with the peer cursor mid-screen (panic key, link
+        // loss); its remembered position must not turn this session's entry into a hand-back.
+        let (state,mut mem,tx,rx)=harness(Edge::Left,SCREEN);
+        state.receiving.store(true,Ordering::SeqCst);
+        state.passthrough.store(true,Ordering::SeqCst);
+        mem.injected=Some((1000.0,540.0));
+        state.receiving_epoch.fetch_add(1,Ordering::SeqCst);
+        assert!(injected(&state,&mut mem,&tx,0.0),"the entry move must reach the machine");
+        assert!(rx.try_recv().is_err(),"the stale position must not hand control straight back");
+        assert!(state.receiving.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_driver_warp_is_not_forwarded_as_travel() {
+        // Re-anchoring warps the ghost cursor with SendInput, and that move comes back through the
+        // same hook. Forwarding it would teleport the peer cursor by the whole pull distance.
+        let (state,mut mem,tx,rx)=harness(Edge::Right,SCREEN);
+        state.remote.store(true,Ordering::SeqCst);
+        mem.last=(1919.0,540.0);
+        mem.warp=Some((1559.0,540.0));
+        assert!(handle(Raw::Move{x:1559.0,y:540.0,dx:0.0,dy:0.0,relative:false},&state,&mut mem,&tx),"the warp itself must still reach this machine");
+        assert_eq!(forwarded_move(&rx),None,"a warp is not travel");
+        assert_eq!(mem.last,(1559.0,540.0));
+        // A move that does not match the pending warp is real travel and must go through.
+        mem.warp=Some((1559.0,540.0));
+        assert!(handle(Raw::Move{x:1400.0,y:540.0,dx:0.0,dy:0.0,relative:false},&state,&mut mem,&tx));
+        assert_eq!(forwarded_move(&rx),Some((-159.0,0.0)));
     }
 
     fn travelled(state:&HookState,mem:&mut HookMemory,tx:&Sender<Captured>,x:f64,y:f64,dx:f64,dy:f64)->bool{

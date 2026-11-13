@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "mouseborder-native"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "display-info",

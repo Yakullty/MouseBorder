@@ -42,7 +42,11 @@ const LOCATION_HID: u32 = 0;
 const PLACE_HEAD: u32 = 0;
 const OPTION_FILTER: u32 = 0;
 
-// CGEventType values subscribed to, plus the two tap notifications.
+// CGEventType values subscribed to, plus the two tap notifications, per CGEventTypes.h. macOS
+// leaves 8 and 9 unused: key events are 10/11, flagsChanged is 12 and the wheel is 22. Reading
+// them as 8/9/10/12 subscribed the wrong bits, so the wheel never reached this tap (it kept
+// scrolling the Mac) and every key press was read as a modifier change and forwarded as a bare
+// release, which is why nothing typed on the peer.
 const LEFT_DOWN: u32 = 1;
 const LEFT_UP: u32 = 2;
 const RIGHT_DOWN: u32 = 3;
@@ -50,15 +54,15 @@ const RIGHT_UP: u32 = 4;
 const MOUSE_MOVED: u32 = 5;
 const LEFT_DRAGGED: u32 = 6;
 const RIGHT_DRAGGED: u32 = 7;
-const KEY_DOWN: u32 = 8;
-const KEY_UP: u32 = 9;
-const FLAGS_CHANGED: u32 = 10;
-const SCROLL_WHEEL: u32 = 12;
+const KEY_DOWN: u32 = 10;
+const KEY_UP: u32 = 11;
+const FLAGS_CHANGED: u32 = 12;
+const SCROLL_WHEEL: u32 = 22;
 const OTHER_DOWN: u32 = 25;
 const OTHER_UP: u32 = 26;
 const OTHER_DRAGGED: u32 = 27;
-const DISABLED_BY_TIMEOUT: u32 = 14;
-const DISABLED_BY_USER: u32 = 15;
+const DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+const DISABLED_BY_USER: u32 = 0xFFFF_FFFF;
 
 // CGEventField values, per CGEventFields.h (mirrored by core-graphics' EventField).
 // 6/7 are InstantMouser/Subtype and read as zero for a plain mouse: using them silently forwards
@@ -67,6 +71,14 @@ const FIELD_MOUSE_DELTA_X: u32 = 4;
 const FIELD_MOUSE_DELTA_Y: u32 = 5;
 const FIELD_KEYCODE: u32 = 9;
 const FIELD_EVENT_SOURCE_PID: u32 = 41;
+// kCGScrollWheelEventDeltaAxis1/2: whole lines, and what a notched wheel reports (one line per
+// notch). The point deltas below carry the pixel travel of a trackpad, where the line delta is
+// coarse, so they are only the fallback.
+const FIELD_WHEEL_LINE_Y: u32 = 11;
+const FIELD_WHEEL_LINE_X: u32 = 12;
+// kCGScrollWheelEventIsContinuous: trackpads and the Magic Mouse scroll continuously and only the
+// point deltas are fine-grained; a notched wheel reports discrete lines.
+const FIELD_WHEEL_CONTINUOUS: u32 = 88;
 const FIELD_WHEEL_POINT_Y: u32 = 96;
 const FIELD_WHEEL_POINT_X: u32 = 97;
 
@@ -92,6 +104,9 @@ struct Ctx {
     tap: Cell<Ref>,
     /// How often the system has switched the tap off underneath us; any of those silences the pin.
     disabled: Cell<u64>,
+    /// Key events seen so far. The first few are logged: that is the only way to tell "the tap
+    /// never receives keys" (missing Input Monitoring) from "keys arrive but the peer drops them".
+    keys: Cell<u64>,
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -233,6 +248,25 @@ fn reassert_lock() {
 
 // MARK: - Event translation
 
+/// Scroll distance in wire ticks (1/120 notch). A notched wheel reports whole lines, which is
+/// exact; a continuous device (trackpad, Magic Mouse) only has meaningful pixel travel.
+unsafe fn wheel_ticks(event: Ref) -> (i64, i64) {
+    let continuous = CGEventGetIntegerValueField(event, FIELD_WHEEL_CONTINUOUS) != 0;
+    if !continuous {
+        let (lx, ly) = (
+            CGEventGetIntegerValueField(event, FIELD_WHEEL_LINE_X),
+            CGEventGetIntegerValueField(event, FIELD_WHEEL_LINE_Y),
+        );
+        if lx != 0 || ly != 0 {
+            return (lx * input::WHEEL_TICKS_PER_NOTCH, ly * input::WHEEL_TICKS_PER_NOTCH);
+        }
+    }
+    (
+        CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) * input::WHEEL_TICKS_PER_UNIT,
+        CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) * input::WHEEL_TICKS_PER_UNIT,
+    )
+}
+
 unsafe fn read_raw(event_type: u32, event: Ref) -> Option<input::Raw> {
     let point = CGEventGetLocation(event);
     Some(match event_type {
@@ -248,10 +282,10 @@ unsafe fn read_raw(event_type: u32, event: Ref) -> Option<input::Raw> {
         RIGHT_UP => input::Raw::Button { button: Button::Right, down: false },
         OTHER_DOWN => input::Raw::Button { button: Button::Middle, down: true },
         OTHER_UP => input::Raw::Button { button: Button::Middle, down: false },
-        SCROLL_WHEEL => input::Raw::Wheel {
-            dx: CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_X) * input::WHEEL_TICKS_PER_UNIT,
-            dy: CGEventGetIntegerValueField(event, FIELD_WHEEL_POINT_Y) * input::WHEEL_TICKS_PER_UNIT,
-        },
+        SCROLL_WHEEL => {
+            let (dx, dy) = wheel_ticks(event);
+            input::Raw::Wheel { dx, dy }
+        }
         KEY_DOWN => input::Raw::Key { code: key_from_code(CGEventGetIntegerValueField(event, FIELD_KEYCODE)), down: true },
         KEY_UP => input::Raw::Key { code: key_from_code(CGEventGetIntegerValueField(event, FIELD_KEYCODE)), down: false },
         FLAGS_CHANGED => {
@@ -287,6 +321,14 @@ extern "C" fn on_event(_proxy: u32, event_type: u32, event: Ref, refcon: Ref) ->
         return event;
     }
     let Some(raw) = (unsafe { read_raw(event_type, event) }) else { return event };
+    if matches!(event_type, KEY_DOWN | KEY_UP | FLAGS_CHANGED) {
+        let count = ctx.keys.get() + 1;
+        ctx.keys.set(count);
+        if count <= 3 {
+            eprintln!("mouseborder: key event #{count} type={event_type} remote={}",
+                ctx.state.remote.load(Ordering::Relaxed));
+        }
+    }
     // Our own injections come back through this tap. The source process id is the only marker a
     // race cannot lose, so these bypass every local rule instead of feeding the handoff logic.
     if unsafe { CGEventGetIntegerValueField(event, FIELD_EVENT_SOURCE_PID) } == unsafe { getpid() } as i64 {
@@ -321,6 +363,7 @@ pub fn start(tx: Sender<Captured>, state: HookState) -> Result<(), String> {
         memory: input::HookMemory::default(),
         tap: Cell::new(std::ptr::null_mut()),
         disabled: Cell::new(0),
+        keys: Cell::new(0),
     });
     let refcon = Box::into_raw(ctx) as Ref;
     let tap = unsafe { CGEventTapCreate(LOCATION_HID, PLACE_HEAD, OPTION_FILTER, mask(), on_event, refcon) };
@@ -379,12 +422,79 @@ fn key_from_code(code: i64) -> Key {
 mod tests {
     use super::*;
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateScrollWheelEvent(source: Ref, units: u32, wheel_count: u32, wheel1: i32, ...) -> Ref;
+        fn CGEventCreateKeyboardEvent(source: Ref, virtual_key: u16, key_down: bool) -> Ref;
+        fn CGEventSetIntegerValueField(event: Ref, field: u32, value: i64);
+    }
+
+    #[test]
+    fn real_events_are_read_as_the_input_they_carry() {
+        // Built with CoreGraphics itself, so the field maths is checked against the same objects
+        // the tap receives — no permissions involved, and it catches a wrong type constant.
+        unsafe {
+            // A notched wheel: one line, which the synthetic factory marks as continuous.
+            let wheel = CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 0 /* line */, 1, -1);
+            assert!(!wheel.is_null());
+            CGEventSetIntegerValueField(wheel, FIELD_WHEEL_CONTINUOUS, 0);
+            match read_raw(SCROLL_WHEEL, wheel) {
+                Some(input::Raw::Wheel{dx,dy}) => {
+                    assert_eq!(dx, 0);
+                    assert_eq!(dy, -input::WHEEL_TICKS_PER_NOTCH, "one line is one notch");
+                }
+                _ => panic!("a scroll event must read back as a wheel"),
+            }
+            CFRelease(wheel);
+
+            // A trackpad: continuous, and only the point delta carries the travel (10 px per notch).
+            let trackpad = CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 1 /* pixel */, 1, -3);
+            assert!(!trackpad.is_null());
+            CGEventSetIntegerValueField(trackpad, FIELD_WHEEL_CONTINUOUS, 1);
+            match read_raw(SCROLL_WHEEL, trackpad) {
+                Some(input::Raw::Wheel{dx,dy}) => {
+                    assert_eq!(dx, 0);
+                    assert_eq!(dy, -30 * input::WHEEL_TICKS_PER_UNIT, "pixel travel is kept");
+                }
+                _ => panic!("a pixel scroll event must read back as a wheel"),
+            }
+            CFRelease(trackpad);
+
+            let key = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0 /* kVK_ANSI_A */, true);
+            assert!(!key.is_null());
+            match read_raw(KEY_DOWN, key) {
+                Some(input::Raw::Key{code,down}) => { assert_eq!(code, Key::KeyA); assert!(down); }
+                _ => panic!("a key event must read back as a key press"),
+            }
+            CFRelease(key);
+        }
+    }
+
+    #[test]
+    fn event_types_match_the_public_header() {
+        // One wrong number here silently drops a whole class of input: the wheel kept scrolling the
+        // Mac and key presses only ever reached the peer as releases.
+        assert_eq!((LEFT_DOWN, LEFT_UP, RIGHT_DOWN, RIGHT_UP), (1, 2, 3, 4));
+        assert_eq!((MOUSE_MOVED, LEFT_DRAGGED, RIGHT_DRAGGED), (5, 6, 7));
+        assert_eq!((KEY_DOWN, KEY_UP, FLAGS_CHANGED), (10, 11, 12));
+        assert_eq!((SCROLL_WHEEL, OTHER_DOWN, OTHER_UP, OTHER_DRAGGED), (22, 25, 26, 27));
+        assert_eq!(DISABLED_BY_TIMEOUT, 0xFFFF_FFFE);
+        assert_eq!(DISABLED_BY_USER, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn wheel_delta_fields_are_the_ones_the_header_names() {
+        assert_eq!((FIELD_WHEEL_LINE_Y, FIELD_WHEEL_LINE_X), (11, 12));
+        assert_eq!(FIELD_WHEEL_CONTINUOUS, 88);
+        assert_eq!((FIELD_WHEEL_POINT_Y, FIELD_WHEEL_POINT_X), (96, 97));
+    }
+
     #[test]
     fn mask_covers_every_forwarded_event_type() {
         for t in [LEFT_DOWN, LEFT_UP, RIGHT_DOWN, RIGHT_UP, MOUSE_MOVED, LEFT_DRAGGED, RIGHT_DRAGGED, KEY_DOWN, KEY_UP, FLAGS_CHANGED, SCROLL_WHEEL, OTHER_DOWN, OTHER_UP] {
             assert!(mask() & (1u64 << t) != 0, "type {t} is not subscribed");
         }
-        assert_eq!(mask() & (1u64 << DISABLED_BY_TIMEOUT), 0, "tap notifications are not events");
+        assert!(DISABLED_BY_TIMEOUT > 63 && DISABLED_BY_USER > 63, "tap notifications are not event types");
     }
 
     #[test]

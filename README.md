@@ -16,9 +16,13 @@
 | 接收端注入（移动/滚轮/坏 MAC 拒绝/还原） | 已验证（macOS 实机） | `native/tests/input_link.rs` 实机通过 |
 | 多屏并集几何、四侧交接、滚轮单位换算 | 已验证逻辑 | `cargo test` 单元测试 |
 | 跨屏状态机（进入钉点、设备位移驱动、外推交还、0.2s 宽限 / 0.5s 冷却、按住鼠标键不交还、落点换算） | 已验证逻辑 | `cargo test` 单元测试 |
+| 滚轮/按键的事件类型与字段（用 CoreGraphics 自建事件回读校验） | 已验证逻辑 | `cargo test` 单元测试 |
+| Windows 被控端不吞自己的注入（掉帧/滚轮键盘失效的修复） | 已验证逻辑 | `cargo test` 单元测试；实机仍待双机验证 |
 | 边缘交接手感（本机光标是否真的钉住、隐藏是否生效） | **未验证** | 需要双机实测；交接时日志里的 `pointer pinned … cursor hidden / STILL VISIBLE` 是判据 |
 
 macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIToolbox 的 `TISGetInputSourceProperty`，而该 API 断言必须在主队列执行，tap 回调跑在后台线程，第一次物理按键就会 `dispatch_assert_queue_fail` → SIGTRAP。现在由 [native/src/tap.rs](native/src/tap.rs) 自建 `CGEventTap`，只读标量字段，并直接取设备相对位移；注入仍走 `rdev::simulate`。
+
+事件类型必须与 `CGEventTypes.h` 对齐：键盘按下/抬起是 **10/11**，修饰键是 **12**，滚轮是 **22**（8/9 在 macOS 是未使用值）。用错时滚轮事件根本不在订阅掩码里（照旧滚本机），而键盘按下会被当成修饰键变化、只转发成「抬起」，于是对端一个字符都收不到。`cargo test` 里的 `real_events_are_read_as_the_input_they_carry` 用 CoreGraphics 自建的滚轮/按键事件回读校验这条链路。
 
 ## 功能
 
@@ -30,7 +34,8 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 - 进入时驱动端发送一次绝对落点（`MoveTo`），对端光标出现在**朝向本机的那条边**上，而不是对端桌面正中间——否则往回推要先横跨半个屏幕。
 - 鼠标移动、按键、滚轮、常用键盘键注入；文本剪贴板 500ms 轮询同步。
 - 几何按**所有显示器的并集矩形**计算（副屏在主屏左/上方时原点为负），每 2s 跟随插拔与分辨率变化。Windows 的绝对移动不走 rdev：它按 `GetSystemMetrics(SM_CXVIRTUALSCREEN)` 归一化，而该值受 DPI 虚拟化影响，缩放桌面上会与 `display_info` 的 DEVMODE 并集不一致；现在自己按同一个并集矩形换算成 0..65535 再 `SendInput`（`VIRTUALDESK`），光标回拉也走这条路径。
-- 滚轮在线路上统一为 1/120 格（Windows `WHEEL_DELTA`）：macOS 的像素增量按每格约 10px 换算，注入时保留小数余数累加，触控板的细碎增量不会被逐条截断成 0。
+- 滚轮在线路上统一为 1/120 格（Windows `WHEEL_DELTA`）：macOS 有齿滚轮读「行」增量（一行 = 一格），触控板/连续滚动读像素增量按每格约 10px 换算，注入时保留小数余数累加，触控板的细碎增量不会被逐条截断成 0。
+- Windows 作为**被控端**时不再吞自己的注入：低层钩子靠返回非零拦截事件，而本进程 `SendInput` 的产物会原样经过同一个钩子。旧实现用一个 3ms 的「注入中」标志去分辨，钩子回调迟一点就会被当成用户输入吞掉——鼠标掉帧、滚轮和键盘完全没反应就是这么来的；而且每条注入 sleep 3ms 把注入速率压在约 330 次/秒。现在被控期间一律放行，macOS 被控端仍靠来源进程号精确识别，照旧拦截杂散的本机输入。
 - 交接期间本机幽灵光标贴边时自动回拉，避免绝对坐标推导位移在边缘归零（原 tanking 问题，Windows 驱动端）；macOS 驱动端改为钉住光标，不再需要幽灵游走。
 - 断线自动重连（1→2→4→…10s 退避）；配对码错误等不可自愈的情况停止并提示。
 - 设置写入 `<appData>/settings.json`，重启后保留。
@@ -42,7 +47,7 @@ macOS 的输入捕获不再使用 `rdev::grab`：它在每次按键时调用 HIT
 ```sh
 cd native
 cargo tauri dev     # 调试运行
-cargo test          # 45 个单元测试
+cargo test          # 51 个单元测试
 ```
 
 ### 本机端到端自测（不需要第二台机器）
