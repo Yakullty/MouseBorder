@@ -55,8 +55,8 @@ const HOOK_STOPPED: u8 = 0; const HOOK_RUNNING: u8 = 1; const HOOK_FAILED: u8 = 
 impl Core {
     pub fn new()->Arc<Self>{
         let hostname=std::env::var("COMPUTERNAME").or_else(|_|std::env::var("HOSTNAME")).unwrap_or_else(|_|"MouseBorder".into());
-        let pin=initial_pin(); let (sx,sy,sw,sh)=screen_rect(); let hook=HookState::new();
-        hook.set_screen(sx,sy,sw,sh);
+        let pin=initial_pin(); let hook=HookState::new();
+        if let Some((sx,sy,sw,sh))=screen_rect(){hook.set_screen(sx,sy,sw,sh);}
         let defaults=Settings::default();
         Arc::new(Self{ui:Mutex::new(UiState{hostname,pin:pin.clone(),status:"waiting".into(),peer:String::new(),edge:defaults.edge.clone(),error:String::new(),notice:String::new(),edge_enabled:defaults.edge_enabled,clipboard_enabled:defaults.clipboard_enabled,hook:"stopped".into(),control:"local".into(),devices:Vec::new()}),pin:RwLock::new(pin),out:Mutex::new(None),hook,app:Mutex::new(None),clipboard_echo:Mutex::new(String::new()),edge_enabled:AtomicBool::new(defaults.edge_enabled),clipboard_enabled:AtomicBool::new(defaults.clipboard_enabled),target:Mutex::new(None),link:AtomicUsize::new(0),devices:Mutex::new(Vec::new()),transfer:AtomicU64::new(1),capture:Mutex::new(None),hook_state:AtomicU8::new(HOOK_STOPPED)})
     }
@@ -118,9 +118,9 @@ impl Core {
         let (tx,rx)=mpsc::channel();*self.capture.lock().unwrap()=Some(Arc::new(tx));
         let c=self.clone();thread::spawn(move||while let Ok(ev)=rx.recv(){match ev{Captured::EnterRemote=>{c.update(|s|s.control="remote".into());c.send(Message::Control{enabled:true})},Captured::ReturnLocal=>{c.update(|s|s.control="local".into());c.send(Message::ReturnControl)},Captured::Event(event)=>c.send(Message::Input{event})}});
         // Displays can be plugged in or rearranged while the app runs; the handoff edges follow.
-        let c=self.clone();thread::spawn(move||loop{let(x,y,w,h)=screen_rect();c.hook.set_screen(x,y,w,h);thread::sleep(Duration::from_secs(2));});
+        let c=self.clone();thread::spawn(move||loop{if let Some((x,y,w,h))=screen_rect(){c.hook.set_screen(x,y,w,h);}thread::sleep(Duration::from_secs(2));});
         self.spawn_hook();
-        let c=self.clone();thread::spawn(move||{let mut previous=String::new();loop{
+        let c=self.clone();thread::spawn(move||{startup_sweep(&c);let mut previous=String::new();loop{
             if c.clipboard_enabled.load(Ordering::Relaxed){
                 if let Ok(mut clip)=arboard::Clipboard::new(){
                     if let Some((sig,payload))=clipboard::read(&mut clip){
@@ -139,6 +139,7 @@ impl Core {
         match payload{
             clipboard::Payload::Text(text)=>self.send(Message::Clipboard{text:text.clone()}),
             clipboard::Payload::Image(png)=>{
+                if png.len() as u64>clipboard::MAX_TRANSFER{self.update(|s|s.error="图片超过 64 MiB 上限，未传输".into());return;}
                 let transfer=self.transfer.fetch_add(1,Ordering::SeqCst);
                 self.send(Message::ClipboardImage{transfer,size:png.len() as u64});
                 clipboard::split_chunks(png,|data|self.send_chunk(CHUNK_IMAGE,transfer,data));
@@ -173,6 +174,17 @@ impl Core {
                 Ok(())=>{
                     if let Some((sig,_))=clipboard::read(&mut clip){*c.clipboard_echo.lock().unwrap()=sig.clone();trace(&format!("receive[{kind}] 写入成功，回读={sig}"));}
                     else{trace(&format!("receive[{kind}] 写入成功，但回读为空"));}
+                    // The clipboard now points at this transfer's folder; every older one is garbage.
+                    if let clipboard::Payload::Files(paths)=&payload {
+                        if let Some(dir)=paths.first().and_then(|p|p.parent()) {
+                            if let Some(root)=dir.parent() {
+                                if root.file_name().is_some_and(|n|n=="received") {
+                                    clipboard::sweep_received(root,Some(dir));
+                                    trace(&format!("receive[{kind}] 清理旧接收目录，保留 {}",dir.display()));
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e)=>{trace(&format!("receive[{kind}] 写入剪贴板失败：{e}"));c.update(|s|{s.notice.clear();s.error=format!("写入剪贴板失败：{e}");});}
             }
@@ -256,7 +268,11 @@ fn union_rect(bounds:impl Iterator<Item=(i32,i32,i32,i32)>)->(i32,i32,u32,u32){
     if x1<=x0||y1<=y0 { return (0,0,1920,1080); }
     (x0,y0,(x1-x0) as u32,(y1-y0) as u32)
 }
-fn screen_rect()->(i32,i32,u32,u32){union_rect(DisplayInfo::all().unwrap_or_default().iter().map(|d|(d.x,d.y,d.x+d.width as i32,d.y+d.height as i32)))}
+fn screen_rect()->Option<(i32,i32,u32,u32)>{
+    let infos=DisplayInfo::all().unwrap_or_default();
+    if infos.is_empty(){return None;}
+    Some(union_rect(infos.iter().map(|d|(d.x,d.y,d.x+d.width as i32,d.y+d.height as i32))))
+}
 
 pub fn settings_path(app:&AppHandle)->PathBuf{app.path().app_data_dir().unwrap_or_else(|_|std::env::temp_dir()).join("settings.json")}
 pub fn read_settings(path:&Path)->Option<Settings>{
@@ -319,7 +335,7 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
         };
         if sent.is_err(){break;}
     }});
-    let(x,y,w,h)=screen_rect();let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
+    let(x,y,w,h)=screen_rect().unwrap_or((0,0,1920,1080));let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
     let mut queued:VecDeque<Frame>=VecDeque::new();
     let mut incoming:Option<clipboard::Incoming>=None;
     let mut image:Option<(u64,u64,Vec<u8>)>=None;
@@ -341,7 +357,7 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
             match &event{InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}
             if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}
         },
-        Frame::Body(Message::Control{enabled})=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
+        Frame::Body(Message::Control{enabled})=>{if let Some((x,y,w,h))=screen_rect(){core.hook.set_screen(x,y,w,h);}if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
         Frame::Body(Message::Disconnect)=>{peer_closed=true;break},
         Frame::Body(Message::ReturnControl)=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
         // Awaiting the clipboard thread here would stall every input frame queued behind it.
@@ -387,6 +403,21 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
 fn received_dir(core:&Core,transfer:u64)->PathBuf{
     let base=core.app.lock().unwrap().as_ref().and_then(|a|a.path().app_data_dir().ok()).unwrap_or_else(std::env::temp_dir);
     base.join("received").join(transfer.to_string())
+}
+/// One-time cleanup of the previous run's received folders. Keeps any folder the current clipboard
+/// still points at so a paste survives an app restart; everything else is unreachable garbage.
+fn startup_sweep(core:&Core){
+    let base=core.app.lock().unwrap().as_ref().and_then(|a|a.path().app_data_dir().ok()).unwrap_or_else(std::env::temp_dir);
+    let root=base.join("received");
+    if !root.is_dir(){return;}
+    let keep=arboard::Clipboard::new().ok().and_then(|mut clip|clip.get().file_list().ok()).and_then(|files|{
+        files.iter().find_map(|p|{
+            let dir=p.parent()?;
+            (dir.parent()==Some(root.as_path())).then(||dir.to_path_buf())
+        })
+    });
+    clipboard::sweep_received(&root,keep.as_deref());
+    trace(&format!("startup 清理接收目录，保留 {:?}",keep));
 }
 /// Next verified frame, or `None` once the link ends. Unrecognised frames and failed MACs are skipped.
 async fn next_body<S>(stream:&mut SplitStream<WebSocketStream<S>>,key:&str)->Option<Frame>

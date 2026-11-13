@@ -37,6 +37,10 @@ pub fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Opt-in handoff tracing (MOUSEBORDER_TRACE=1): logs the exact cursor position and screen rect at
+/// each edge handoff, so a premature trigger can be diagnosed from the coordinates that fired it.
+fn trace(msg:&str){if std::env::var_os("MOUSEBORDER_TRACE").is_some(){eprintln!("[mouseborder] {msg}");}}
+
 /// Wheel deltas travel as 1/120 of a notch, the unit Windows' WHEEL_DELTA and rdev's Windows
 /// backend use. Each capture layer scales its own device unit up to this, each injector back down.
 pub const WHEEL_TICKS_PER_NOTCH: i64 = 120;
@@ -291,7 +295,10 @@ fn move_event(x:f64,y:f64,dx:f64,dy:f64,relative:bool,state:&HookState,mem:&mut 
         }
         let armed=!state.entry_rearm.load(Ordering::Relaxed) && now>=blocked_until;
         mem.last=(x,y);
-        if at_edge && armed { enter_remote(x,y,r,edge,state,mem,tx); }
+        if at_edge && armed {
+            trace(&format!("handoff edge={} pt=({x:.0},{y:.0}) band=[{lo:.0},{hi:.0}] rect=({:.0},{:.0},{:.0},{:.0})",edge.as_str(),r.x,r.y,r.w,r.h));
+            enter_remote(x,y,r,edge,state,mem,tx);
+        }
         return true;
     }
 

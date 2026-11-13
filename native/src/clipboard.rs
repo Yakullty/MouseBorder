@@ -218,6 +218,18 @@ pub fn safe_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Deletes every transfer folder under `root` except `keep`. The clipboard only ever points at the
+/// newest transfer, so once a new one lands the older folders are unreachable garbage. Best-effort:
+/// a folder still open elsewhere simply fails to delete and is retried on the next sweep.
+pub fn sweep_received(root: &Path, keep: Option<&Path>) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || keep == Some(path.as_path()) { continue }
+        let _ = fs::remove_dir_all(&path);
+    }
+}
+
 fn too_big(total: u64) -> String {
     format!("文件共 {} MiB，超过 {} MiB 上限", total / 1_048_576, MAX_TRANSFER / 1_048_576)
 }
@@ -276,6 +288,9 @@ impl Incoming {
         for e in &entries {
             if safe_name(&e.name).is_none() { return Err(format!("文件名不安全：{}", e.name)) }
         }
+        // The transfer counter restarts each run, so an id can collide with a folder left by the
+        // previous run; start empty so a paste never yields a mix of old and new files.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut me = Self { transfer, entries, index: 0, written: 0, dir, file: None, done: Vec::new() };
         me.open_next()?;
@@ -389,6 +404,35 @@ mod tests {
         let big = dir.join("big.bin");
         fs::File::create(&big).unwrap().set_len(MAX_TRANSFER + 1).unwrap();
         assert!(plan(&[big]).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sweep_keeps_only_the_named_transfer_folder() {
+        let root = tmp("sweep");
+        for id in ["1", "2", "3"] {
+            fs::create_dir_all(root.join(id)).unwrap();
+            fs::write(root.join(id).join("f"), b"x").unwrap();
+        }
+        fs::write(root.join("stray.txt"), b"not a folder").unwrap();
+        sweep_received(&root, Some(&root.join("2")));
+        assert!(!root.join("1").exists());
+        assert!(root.join("2").join("f").exists(), "the kept transfer must survive");
+        assert!(!root.join("3").exists());
+        assert!(root.join("stray.txt").exists(), "a non-folder entry is left alone");
+        sweep_received(&root, None);
+        assert!(!root.join("2").exists(), "no keep removes every transfer folder");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reused_transfer_id_starts_from_an_empty_folder() {
+        let dir = tmp("reuse");
+        fs::write(dir.join("stale.bin"), b"old").unwrap();
+        let mut inc = Incoming::new(1, vec![FileEntry { name: "new.bin".into(), size: 3 }], dir.clone()).unwrap();
+        assert!(inc.chunk(b"abc").unwrap());
+        assert!(!dir.join("stale.bin").exists(), "a previous run's file must not linger");
+        assert_eq!(fs::read(dir.join("new.bin")).unwrap(), b"abc");
         let _ = fs::remove_dir_all(&dir);
     }
 
