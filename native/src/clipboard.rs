@@ -4,19 +4,15 @@
 
 use crate::protocol::FileEntry;
 use arboard::{Clipboard, ImageData};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use sha2::{Digest, Sha256};
 use std::{fs, io::{Cursor, Read, Write}, path::{Path, PathBuf}};
 
-/// Raw bytes per wire message. The send channel is unbounded, so the transfer cap below is what
+/// Raw bytes per wire frame. The send channel is unbounded, so the transfer cap below is what
 /// keeps a large copy from being held in memory all at once.
 pub const CHUNK: usize = 256 * 1024;
 pub const MAX_TRANSFER: u64 = 64 * 1024 * 1024;
 
 pub enum Payload { Text(String), Image(Vec<u8>), Files(Vec<PathBuf>) }
-
-pub fn b64(bytes: &[u8]) -> String { STANDARD.encode(bytes) }
-pub fn unb64(text: &str) -> Option<Vec<u8>> { STANDARD.decode(text).ok() }
 
 fn hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -117,15 +113,20 @@ pub fn plan(files: &[PathBuf]) -> Result<(Vec<FileEntry>, Vec<PathBuf>), String>
     Ok((entries, paths))
 }
 
-pub fn read_chunks(path: &Path, mut emit: impl FnMut(String)) -> Result<(), String> {
+pub fn read_chunks(path: &Path, mut emit: impl FnMut(Vec<u8>)) -> Result<(), String> {
     let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = f.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 { break }
-        emit(b64(&buf[..n]));
+        emit(buf[..n].to_vec());
     }
     Ok(())
+}
+
+/// Splits an in-memory blob (a PNG) into the same chunk sizes used for files.
+pub fn split_chunks(bytes: &[u8], mut emit: impl FnMut(Vec<u8>)) {
+    for part in bytes.chunks(CHUNK) { emit(part.to_vec()); }
 }
 
 /// Reassembles one announced transfer. Chunks arrive in list order over an ordered stream, so the
@@ -265,16 +266,19 @@ mod tests {
     }
 
     #[test]
-    fn chunking_a_file_round_trips_through_base64() {
+    fn chunking_a_file_round_trips_as_raw_bytes() {
         let dir = tmp("chunks");
         let path = dir.join("payload.bin");
         let bytes: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
         fs::write(&path, &bytes).unwrap();
         let mut joined = Vec::new();
         let mut count = 0;
-        read_chunks(&path, |part| { joined.extend(unb64(&part).unwrap()); count += 1; }).unwrap();
+        read_chunks(&path, |part| { joined.extend(part); count += 1; }).unwrap();
         assert_eq!(joined, bytes);
         assert_eq!(count, 3, "two full chunks and a remainder");
+        let mut split = Vec::new();
+        split_chunks(&bytes, |part| split.extend(part));
+        assert_eq!(split, bytes);
         let _ = fs::remove_dir_all(&dir);
     }
 

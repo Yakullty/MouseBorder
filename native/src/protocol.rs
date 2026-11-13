@@ -20,11 +20,10 @@ pub enum Message {
     },
     Input { event: InputEvent },
     Clipboard { text: String },
-    /// Base64 PNG. A screenshot is pixels, not a path the peer could resolve.
-    ClipboardImage { png: String },
-    /// Announces a file copy; the bytes follow as `FileChunk` messages in list order.
+    /// Announces an image copy; the PNG bytes follow as authenticated binary frames, not as text.
+    ClipboardImage { transfer: u64, size: u64 },
+    /// Announces a file copy; the bytes follow as authenticated binary frames in list order.
     ClipboardFiles { transfer: u64, files: Vec<FileEntry> },
-    FileChunk { transfer: u64, data: String },
     ReturnControl,
     Control { enabled: bool },
     Ping,

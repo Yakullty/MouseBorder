@@ -23,6 +23,14 @@ pub struct UiState { pub hostname:String, pub pin:String, pub status:String, pub
 #[derive(Serialize, Deserialize, Clone)]
 struct Packet { mac:String, body:Message }
 
+/// One unit on the wire. Control travels as signed JSON text; bulk clipboard bytes travel as
+/// signed binary frames (`[32-byte MAC][kind][transfer LE][payload]`) so a file copy is not a
+/// base64 text blob, which is both cheaper and a less malware-like static profile.
+#[derive(Debug, Clone, PartialEq)]
+enum Frame { Body(Message), Chunk{kind:u8, transfer:u64, data:Vec<u8>} }
+const CHUNK_FILE: u8 = 1;
+const CHUNK_IMAGE: u8 = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings { pub edge:String, pub edge_enabled:bool, pub clipboard_enabled:bool, #[serde(default)] pub devices:Vec<Device> }
 impl Default for Settings { fn default()->Self{ Self{ edge:"right".into(), edge_enabled:true, clipboard_enabled:true, devices:Vec::new() } } }
@@ -37,7 +45,7 @@ pub struct Device { pub host:String, pub label:String, pub token:String }
 struct Target { host:String, pin:String, token:Option<String> }
 
 pub struct Core {
-    pub ui:Mutex<UiState>, pin:RwLock<String>, out:Mutex<Option<tmpsc::UnboundedSender<Message>>>,
+    pub ui:Mutex<UiState>, pin:RwLock<String>, out:Mutex<Option<tmpsc::UnboundedSender<Frame>>>,
     pub hook:HookState, app:Mutex<Option<AppHandle>>, clipboard_echo:Mutex<String>, pub edge_enabled:AtomicBool, pub clipboard_enabled:AtomicBool,
     target:Mutex<Option<Target>>, link:AtomicUsize, devices:Mutex<Vec<Device>>, transfer:AtomicU64,
     capture:Mutex<Option<Arc<mpsc::Sender<Captured>>>>, hook_state:AtomicU8,
@@ -102,7 +110,9 @@ impl Core {
         let Some(token)=self.token_for(&host) else {self.update(|s|s.error="没有这台设备的授权记录，请用配对码连接".into());return};
         self.dial(Target{host,pin:String::new(),token:Some(token)});
     }
-    pub fn send(&self,m:Message){if let Some(tx)=self.out.lock().unwrap().as_ref(){let _=tx.send(m);}}
+    pub fn send(&self,m:Message){self.send_frame(Frame::Body(m));}
+    fn send_frame(&self,f:Frame){if let Some(tx)=self.out.lock().unwrap().as_ref(){let _=tx.send(f);}}
+    fn send_chunk(&self,kind:u8,transfer:u64,data:Vec<u8>){self.send_frame(Frame::Chunk{kind,transfer,data});}
     pub fn start(self:&Arc<Self>){
         let c=self.clone();tauri::async_runtime::spawn(async move{if let Err(e)=server(c.clone()).await{c.update(|s|s.error=format!("本机监听启动失败：{e}"));}});
         let (tx,rx)=mpsc::channel();*self.capture.lock().unwrap()=Some(Arc::new(tx));
@@ -127,14 +137,18 @@ impl Core {
     fn send_payload(&self,payload:&clipboard::Payload){
         match payload{
             clipboard::Payload::Text(text)=>self.send(Message::Clipboard{text:text.clone()}),
-            clipboard::Payload::Image(png)=>self.send(Message::ClipboardImage{png:clipboard::b64(png)}),
+            clipboard::Payload::Image(png)=>{
+                let transfer=self.transfer.fetch_add(1,Ordering::SeqCst);
+                self.send(Message::ClipboardImage{transfer,size:png.len() as u64});
+                clipboard::split_chunks(png,|data|self.send_chunk(CHUNK_IMAGE,transfer,data));
+            },
             clipboard::Payload::Files(paths)=>match clipboard::plan(paths){
                 Err(e)=>self.update(|s|s.error=e),
                 Ok((files,paths))=>{
                     let transfer=self.transfer.fetch_add(1,Ordering::SeqCst);
                     self.send(Message::ClipboardFiles{transfer,files});
                     for path in paths{
-                        if let Err(e)=clipboard::read_chunks(&path,|data|self.send(Message::FileChunk{transfer,data})){
+                        if let Err(e)=clipboard::read_chunks(&path,|data|self.send_chunk(CHUNK_FILE,transfer,data)){
                             self.update(|s|s.error=format!("读取文件失败：{e}"));break;
                         }
                     }
@@ -279,22 +293,29 @@ async fn connect_peer(core:Arc<Core>,target:&Target)->Result<(),String>{
 }
 async fn install<S>(core:Arc<Core>,ws:WebSocketStream<S>,key:String,peer:String)
 where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
-    let(tx,mut rx)=tmpsc::unbounded_channel::<Message>();
+    let(tx,mut rx)=tmpsc::unbounded_channel::<Frame>();
     {let mut out=core.out.lock().unwrap();if out.is_some(){return}*out=Some(tx);}
     // Captured before any await: if the peer hangs up we end exactly this generation's retry loop.
     let gen=core.link.load(Ordering::SeqCst);
     let(mut sink,mut stream)=ws.split();
     core.hook.enabled.store(core.edge_enabled.load(Ordering::SeqCst),Ordering::SeqCst);
     core.update(|s|{s.status="connected".into();s.peer=peer;s.error.clear();s.notice.clear();});
-    let k=key.clone();let writer=tauri::async_runtime::spawn(async move{while let Some(body)=rx.recv().await{let Ok(bytes)=serde_json::to_vec(&body)else{continue};let mut h=HmacSha256::new_from_slice(k.as_bytes()).unwrap();h.update(&bytes);let packet=Packet{mac:hex(&h.finalize().into_bytes()),body};if let Ok(text)=serde_json::to_string(&packet){if sink.send(WsMessage::Text(text.into())).await.is_err(){break;}}}});
+    let k=key.clone();let writer=tauri::async_runtime::spawn(async move{while let Some(frame)=rx.recv().await{
+        let sent=match frame{
+            Frame::Body(body)=>{let Ok(bytes)=serde_json::to_vec(&body)else{continue};let packet=Packet{mac:hex(&mac_bytes(&k,&bytes)),body};match serde_json::to_string(&packet){Ok(text)=>sink.send(WsMessage::Text(text.into())).await,Err(_)=>continue}}
+            Frame::Chunk{kind,transfer,data}=>{let payload=chunk_payload(kind,transfer,&data);let mut bin=mac_bytes(&k,&payload);bin.extend_from_slice(&payload);sink.send(WsMessage::Binary(bin.into())).await}
+        };
+        if sent.is_err(){break;}
+    }});
     let(x,y,w,h)=screen_rect();let mut inj=input::InjectState::new((x as f64+w as f64/2.0,y as f64+h as f64/2.0));let mut held_keys=HashSet::<String>::new();let mut held_buttons=HashSet::new();
-    let mut queued:VecDeque<Message>=VecDeque::new();
+    let mut queued:VecDeque<Frame>=VecDeque::new();
     let mut incoming:Option<clipboard::Incoming>=None;
+    let mut image:Option<(u64,u64,Vec<u8>)>=None;
     let mut peer_closed=false;
     loop{
         let body=match queued.pop_front(){Some(b)=>b,None=>match next_body(&mut stream,&key).await{Some(b)=>b,None=>break}};
         match body{
-        Message::Input{event}=>{
+        Frame::Body(Message::Input{event})=>{
             let event=match event{
                 InputEvent::Move{dx,dy}=>{
                     let mut burst=Vec::new();
@@ -308,31 +329,39 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
             match &event{InputEvent::Key{code,down}=>{if *down{held_keys.insert(code.clone());}else{held_keys.remove(code);}},InputEvent::Button{button,down}=>{if *down{held_buttons.insert(*button);}else{held_buttons.remove(button);}},_=>{}}
             if let Err(e)=input::inject(&event,&mut inj,&core.hook){core.update(|s|s.error=format!("输入注入失败：{e}"));}
         },
-        Message::Control{enabled}=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
-        Message::Disconnect=>{peer_closed=true;break},
-        Message::ReturnControl=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
+        Frame::Body(Message::Control{enabled})=>{let(x,y,w,h)=screen_rect();core.hook.set_screen(x,y,w,h);if enabled{core.hook.receiving_epoch.fetch_add(1,Ordering::SeqCst);}core.hook.receiving.store(enabled,Ordering::SeqCst);core.update(|s|s.control=if enabled{"receiving"}else{"local"}.into());},
+        Frame::Body(Message::Disconnect)=>{peer_closed=true;break},
+        Frame::Body(Message::ReturnControl)=>{input::force_return(&core.hook);core.update(|s|s.control="local".into());},
         // Awaiting the clipboard thread here would stall every input frame queued behind it.
-        Message::Clipboard{text} if core.clipboard_enabled.load(Ordering::Relaxed)=>core.receive_payload(clipboard::Payload::Text(text)),
-        Message::ClipboardImage{png} if core.clipboard_enabled.load(Ordering::Relaxed)=>match clipboard::unb64(&png){
-            Some(bytes)=>core.receive_payload(clipboard::Payload::Image(bytes)),
-            None=>core.update(|s|s.error="收到的图片数据无法解码".into()),
+        Frame::Body(Message::Clipboard{text}) if core.clipboard_enabled.load(Ordering::Relaxed)=>core.receive_payload(clipboard::Payload::Text(text)),
+        Frame::Body(Message::ClipboardImage{transfer,size}) if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+            if size>clipboard::MAX_TRANSFER{core.update(|s|s.error="图片超过大小上限".into());}
+            else{image=Some((transfer,size,Vec::new()));core.update(|s|s.notice="正在接收图片…".into());}
         },
-        Message::ClipboardFiles{transfer,files} if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+        Frame::Body(Message::ClipboardFiles{transfer,files}) if core.clipboard_enabled.load(Ordering::Relaxed)=>{
             let count=files.len();
             match clipboard::Incoming::new(transfer,files,received_dir(&core,transfer)){
                 Ok(inc)=>{incoming=Some(inc);core.update(|s|s.notice=format!("正在接收 {count} 个文件…"));},
                 Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
             }
         },
-        Message::FileChunk{transfer,data} if core.clipboard_enabled.load(Ordering::Relaxed)=>{
-            let Some(inc)=incoming.as_mut().filter(|i|i.transfer==transfer) else {continue};
-            let Some(bytes)=clipboard::unb64(&data) else {continue};
-            match inc.chunk(&bytes){
-                Ok(true)=>{let paths=std::mem::take(&mut inc.done);incoming=None;
-                    core.update(|s|s.notice=format!("已接收 {} 个文件，可直接粘贴",paths.len()));
-                    core.receive_payload(clipboard::Payload::Files(paths));},
-                Ok(false)=>{},
-                Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
+        Frame::Chunk{kind,transfer,data} if core.clipboard_enabled.load(Ordering::Relaxed)=>{
+            if kind==CHUNK_FILE{
+                let Some(inc)=incoming.as_mut().filter(|i|i.transfer==transfer) else {continue};
+                match inc.chunk(&data){
+                    Ok(true)=>{let paths=std::mem::take(&mut inc.done);incoming=None;
+                        core.update(|s|s.notice=format!("已接收 {} 个文件，可直接粘贴",paths.len()));
+                        core.receive_payload(clipboard::Payload::Files(paths));},
+                    Ok(false)=>{},
+                    Err(e)=>{incoming=None;core.update(|s|s.error=format!("接收文件失败：{e}"));},
+                }
+            }else if kind==CHUNK_IMAGE{
+                let Some((t,size,buf))=image.as_mut().filter(|(t,_,_)|*t==transfer) else {continue};
+                if buf.len()+data.len()>*size as usize{image=None;core.update(|s|s.error="图片分块超出声明大小".into());continue;}
+                buf.extend_from_slice(&data);
+                if buf.len()==*size as usize{let bytes=std::mem::take(buf);image=None;
+                    core.update(|s|s.notice="已接收图片，可直接粘贴".into());
+                    core.receive_payload(clipboard::Payload::Image(bytes));}
             }
         },_=>{}
     }}
@@ -345,24 +374,35 @@ fn received_dir(core:&Core,transfer:u64)->PathBuf{
     let base=core.app.lock().unwrap().as_ref().and_then(|a|a.path().app_data_dir().ok()).unwrap_or_else(std::env::temp_dir);
     base.join("received").join(transfer.to_string())
 }
-/// Next verified body, or `None` once the link ends. Non-text frames and failed MACs are skipped.
-async fn next_body<S>(stream:&mut SplitStream<WebSocketStream<S>>,key:&str)->Option<Message>
+/// Next verified frame, or `None` once the link ends. Unrecognised frames and failed MACs are skipped.
+async fn next_body<S>(stream:&mut SplitStream<WebSocketStream<S>>,key:&str)->Option<Frame>
 where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
     loop{
-        let WsMessage::Text(text)=stream.next().await?.ok()? else{continue};
-        let Ok(packet)=serde_json::from_str::<Packet>(&text) else{continue};
-        if verify(key,&packet){return Some(packet.body)}
+        match stream.next().await?.ok()?{
+            WsMessage::Text(text)=>{let Ok(packet)=serde_json::from_str::<Packet>(&text) else{continue};if verify(key,&packet){return Some(Frame::Body(packet.body))}},
+            WsMessage::Binary(bin)=>{if let Some(f)=verify_chunk(key,&bin){return Some(f)}},
+            _=>continue,
+        }
     }
+}
+fn mac_bytes(key:&str,payload:&[u8])->Vec<u8>{let mut h=HmacSha256::new_from_slice(key.as_bytes()).unwrap();h.update(payload);h.finalize().into_bytes().to_vec()}
+fn chunk_payload(kind:u8,transfer:u64,data:&[u8])->Vec<u8>{let mut v=Vec::with_capacity(9+data.len());v.push(kind);v.extend_from_slice(&transfer.to_le_bytes());v.extend_from_slice(data);v}
+fn verify_chunk(key:&str,bin:&[u8])->Option<Frame>{
+    if bin.len()<32+9{return None}
+    let(mac,payload)=bin.split_at(32);
+    let mut h=HmacSha256::new_from_slice(key.as_bytes()).ok()?;h.update(payload);h.verify_slice(mac).ok()?;
+    let kind=payload[0];let transfer=u64::from_le_bytes(payload[1..9].try_into().ok()?);
+    Some(Frame::Chunk{kind,transfer,data:payload[9..].to_vec()})
 }
 /// Folds the moves that arrived in one burst into a single injection. Every SendInput re-enters
 /// this process's own low-level hook, so applying a backlog frame by frame costs a hook round-trip
 /// and a visible cursor jump per frame instead of one smooth step. Anything that is not a move is
 /// handed back untouched, in order.
-fn coalesce_moves(mut total:(f64,f64),burst:Vec<Message>)->((f64,f64),Vec<Message>){
+fn coalesce_moves(mut total:(f64,f64),burst:Vec<Frame>)->((f64,f64),Vec<Frame>){
     let mut left=Vec::new();
     for m in burst{
         match m{
-            Message::Input{event:InputEvent::Move{dx,dy}} if left.is_empty()=>{total.0+=dx;total.1+=dy;}
+            Frame::Body(Message::Input{event:InputEvent::Move{dx,dy}}) if left.is_empty()=>{total.0+=dx;total.1+=dy;}
             other=>left.push(other),
         }
     }
@@ -410,11 +450,11 @@ mod tests {
 
     #[test]
     fn a_burst_of_moves_becomes_one_injection_and_keeps_later_messages_in_order() {
-        let move_by=|dx:f64,dy:f64|Message::Input{event:InputEvent::Move{dx,dy}};
+        let move_by=|dx:f64,dy:f64|Frame::Body(Message::Input{event:InputEvent::Move{dx,dy}});
         let (total,left)=coalesce_moves((1.0,2.0),vec![move_by(3.0,4.0),move_by(-1.0,0.5)]);
         assert_eq!(total,(3.0,6.5));
         assert!(left.is_empty());
-        let control=Message::Control{enabled:true};
+        let control=Frame::Body(Message::Control{enabled:true});
         let (total,left)=coalesce_moves((1.0,1.0),vec![move_by(2.0,2.0),control.clone(),move_by(9.0,9.0)]);
         assert_eq!(total,(3.0,3.0),"only the moves before the first non-move may fold");
         assert_eq!(left,vec![control,move_by(9.0,9.0)],"nothing after a non-move may be dropped");
@@ -438,10 +478,30 @@ mod tests {
         let forged=Packet{mac:hex(b"deadbeef"),body:Message::Input{event:InputEvent::Move{dx:999.0,dy:999.0}}};
         peer.send(WsMessage::Text(serde_json::to_string(&forged).unwrap().into())).await.unwrap();
         send_body(&mut peer,&key,Message::Clipboard{text:"after the forged frame".into()}).await;
-        assert_eq!(next_body(&mut stream,&key).await,Some(Message::Input{event:InputEvent::Move{dx:1.0,dy:2.0}}));
-        assert_eq!(next_body(&mut stream,&key).await,Some(Message::Clipboard{text:"after the forged frame".into()}));
+        // A signed binary chunk must survive; a tampered one must be dropped like a bad text MAC.
+        let payload=chunk_payload(CHUNK_FILE,7,b"raw bytes");
+        let mut bin=mac_bytes(&key,&payload);bin.extend_from_slice(&payload);
+        peer.send(WsMessage::Binary(bin.clone().into())).await.unwrap();
+        let mut forged_bin=bin.clone();forged_bin[40]^=0xff;
+        peer.send(WsMessage::Binary(forged_bin.into())).await.unwrap();
+        assert_eq!(next_body(&mut stream,&key).await,Some(Frame::Body(Message::Input{event:InputEvent::Move{dx:1.0,dy:2.0}})));
+        assert_eq!(next_body(&mut stream,&key).await,Some(Frame::Body(Message::Clipboard{text:"after the forged frame".into()})));
+        assert_eq!(next_body(&mut stream,&key).await,Some(Frame::Chunk{kind:CHUNK_FILE,transfer:7,data:b"raw bytes".to_vec()}));
         drop(peer);
         assert_eq!(next_body(&mut stream,&key).await,None,"a closed link must end the receive loop");
+    }
+
+    #[test]
+    fn binary_chunks_are_authenticated_and_self_describing() {
+        let key="a".repeat(64);
+        let payload=chunk_payload(CHUNK_IMAGE,42,b"png");
+        let mut bin=mac_bytes(&key,&payload);bin.extend_from_slice(&payload);
+        assert_eq!(verify_chunk(&key,&bin),Some(Frame::Chunk{kind:CHUNK_IMAGE,transfer:42,data:b"png".to_vec()}));
+        assert_eq!(verify_chunk("b".repeat(64).as_str(),&bin),None,"another key must not verify");
+        let mut short=bin.clone();short.truncate(40);
+        assert_eq!(verify_chunk(&key,&short),None,"a truncated header must be rejected");
+        let mut tampered=bin.clone();tampered[35]^=1;
+        assert_eq!(verify_chunk(&key,&tampered),None,"a flipped payload byte must fail the MAC");
     }
 
     #[test]
