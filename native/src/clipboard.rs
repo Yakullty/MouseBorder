@@ -43,12 +43,25 @@ pub fn read(clip: &mut Clipboard) -> Option<(String, Payload)> {
             return Some((sig, Payload::Files(files)));
         }
     }
-    if let Ok(img) = clip.get_image() {
+    if let Some(img) = read_image(clip) {
         let sig = format!("image:{}", hash(&img.bytes));
         if let Some(png) = encode_png(&img) { return Some((sig, Payload::Image(png))); }
     }
     if let Ok(text) = clip.get_text() {
         if !text.is_empty() { return Some((format!("text:{text}"), Payload::Text(text))); }
+    }
+    None
+}
+
+/// Reads an image regardless of which clipboard flavour the source app chose. arboard on Windows
+/// only understands a registered "PNG" format or CF_DIBV5, so a screenshot copied by PixPin or
+/// WeChat — which publish classic CF_DIB — comes back as nothing and is never sent. Fall back to
+/// parsing CF_DIB ourselves so those screenshots transfer like any other.
+fn read_image(clip: &mut Clipboard) -> Option<ImageData<'static>> {
+    if let Ok(img) = clip.get_image() { return Some(img); }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(img) = windows::read_image() { return Some(img); }
     }
     None
 }
@@ -129,6 +142,62 @@ fn strip_verbatim(s: &str) -> String {
     else { s.to_string() }
 }
 
+/// Parses a packed DIB (the bytes behind CF_DIB, or a whole BMP including its 14-byte file header)
+/// into straight RGBA. Only the true-colour layouts screenshots use are handled: 24/32 bpp BI_RGB,
+/// and 32 bpp BI_BITFIELDS with the standard masks. In a 32-bit BI_RGB image the fourth byte is a
+/// reserved field, not alpha, so it is forced opaque — honouring it would paste a blank image.
+#[cfg(any(target_os = "windows", test))]
+fn dib_to_rgba(data: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let (base, file_off) = if data.starts_with(b"BM") && data.len() >= 14 {
+        (14usize, Some(u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize))
+    } else {
+        (0usize, None)
+    };
+    let hdr = data.get(base..)?;
+    let u32at = |o: usize| hdr.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    let i32at = |o: usize| hdr.get(o..o + 4).map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    let u16at = |o: usize| hdr.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+
+    let header = u32at(0)? as usize;
+    if header < 40 { return None; } // BITMAPCOREHEADER (12) is not worth supporting
+    let w = i32at(4)?;
+    let raw_h = i32at(8)?;
+    if w <= 0 || raw_h == 0 { return None; }
+    let (w, h) = (w as usize, raw_h.unsigned_abs() as usize);
+    if w > 20_000 || h > 20_000 { return None; }
+    let top_down = raw_h < 0;
+    let bpp = u16at(14)? as usize;
+    let compression = u32at(16)?;
+    let masks = match (compression, bpp) {
+        (0, 24) | (0, 32) => 0usize,                        // BI_RGB
+        (3, 32) if header <= 40 => 12,                      // BI_BITFIELDS + 3 masks follow a 40-byte header
+        (3, 32) => 0,                                       // masks live inside a V4/V5 header
+        _ => return None,                                   // paletted / RLE / non-standard masks
+    };
+    let off = file_off.unwrap_or(base.checked_add(header)?.checked_add(masks)?);
+    let stride = w.checked_mul(bpp)?.checked_add(31)? / 32 * 4;
+    let need = stride.checked_mul(h)?.checked_add(off)?;
+    if data.len() < need { return None; }
+
+    let px = bpp / 8;
+    let mut rgba = vec![0u8; w.checked_mul(h)?.checked_mul(4)?];
+    for row in 0..h {
+        let src_row = if top_down { row } else { h - 1 - row };
+        let src = off + src_row * stride;
+        let dst = row * w * 4;
+        for col in 0..w {
+            let s = src + col * px;
+            let d = dst + col * 4;
+            rgba[d] = data[s + 2];
+            rgba[d + 1] = data[s + 1];
+            rgba[d + 2] = data[s];
+            rgba[d + 3] = 255;
+        }
+    }
+    Some((w, h, rgba))
+}
+
+
 #[cfg(target_os = "macos")]
 mod macos {
     use objc2::{runtime::ProtocolObject, AllocAnyThread};
@@ -176,6 +245,18 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod windows {
     use std::path::{Path, PathBuf};
+
+    /// Reads classic CF_DIB, which arboard on Windows does not touch. Only called after arboard's
+    /// own get_image (PNG flavour / CF_DIBV5) has already failed, so this is purely the fallback
+    /// for the DIB-only screenshot tools.
+    pub fn read_image() -> Option<arboard::ImageData<'static>> {
+        let _clip = clipboard_win::Clipboard::new_attempts(5).ok()?;
+        if !clipboard_win::is_format_avail(clipboard_win::formats::CF_DIB) { return None; }
+        let mut data = Vec::new();
+        clipboard_win::raw::get_vec(clipboard_win::formats::CF_DIB, &mut data).ok()?;
+        let (width, height, rgba) = super::dib_to_rgba(&data)?;
+        Some(arboard::ImageData { width, height, bytes: std::borrow::Cow::Owned(rgba) })
+    }
 
     pub fn write_files(paths: &[PathBuf]) -> Result<(), String> {
         let mut wide = Vec::new();
@@ -478,6 +559,80 @@ mod tests {
         assert_eq!(strip_verbatim(r"\\?\C:\Users\a.txt"), r"C:\Users\a.txt");
         assert_eq!(strip_verbatim(r"\\?\UNC\server\share\a.txt"), r"\\server\share\a.txt");
         assert_eq!(strip_verbatim(r"C:\plain\a.txt"), r"C:\plain\a.txt");
+    }
+
+    fn dib(w: i32, h: i32, bpp: u16, compression: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&40u32.to_le_bytes());        // biSize
+        out.extend_from_slice(&w.to_le_bytes());            // biWidth
+        out.extend_from_slice(&h.to_le_bytes());            // biHeight (negative = top-down)
+        out.extend_from_slice(&1u16.to_le_bytes());         // biPlanes
+        out.extend_from_slice(&bpp.to_le_bytes());          // biBitCount
+        out.extend_from_slice(&compression.to_le_bytes());  // biCompression
+        out.extend_from_slice(&0u32.to_le_bytes());         // biSizeImage
+        out.extend_from_slice(&0i32.to_le_bytes());         // biXPelsPerMeter
+        out.extend_from_slice(&0i32.to_le_bytes());         // biYPelsPerMeter
+        out.extend_from_slice(&0u32.to_le_bytes());         // biClrUsed
+        out.extend_from_slice(&0u32.to_le_bytes());         // biClrImportant
+        out.extend_from_slice(pixels);
+        out
+    }
+
+    /// A classic CF_DIB as PixPin/WeChat publish it: 32 bpp BI_RGB, bottom-up, reserved alpha byte
+    /// left at zero. It must decode to opaque RGBA, not a transparent (blank) paste.
+    #[test]
+    fn a_classic_cf_dib_decodes_bottom_up_and_ignores_the_reserved_alpha_byte() {
+        // Bottom row first (bottom-up storage): blue then (1,2,3); then top row: red then green.
+        let pixels = [
+            255, 0, 0, 0,  3, 2, 1, 0,     // bottom row: B,G,R,reserved
+            0, 0, 255, 0,  0, 255, 0, 0,   // top row: red, green
+        ];
+        let (w, h, rgba) = dib_to_rgba(&dib(2, 2, 32, 0, &pixels)).expect("must decode");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba, vec![
+            255, 0, 0, 255,  0, 255, 0, 255,  // top row
+            0, 0, 255, 255,  1, 2, 3, 255,    // bottom row
+        ], "rows flip to top-down and the reserved fourth byte becomes opaque");
+    }
+
+    #[test]
+    fn a_top_down_24bpp_dib_respects_row_padding() {
+        // stride = ((2*24+31)/32)*4 = 8: each row is 6 bytes of BGR plus 2 pad bytes.
+        let pixels = [
+            0, 0, 255,  0, 255, 0,  9, 9,   // top row: red, green, pad
+            255, 0, 0,  3, 2, 1,    7, 7,   // bottom row: blue, (1,2,3), pad
+        ];
+        let (w, h, rgba) = dib_to_rgba(&dib(2, -2, 24, 0, &pixels)).expect("must decode");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba, vec![
+            255, 0, 0, 255,  0, 255, 0, 255,
+            0, 0, 255, 255,  1, 2, 3, 255,
+        ]);
+    }
+
+    #[test]
+    fn a_bmp_file_header_before_the_dib_is_skipped() {
+        let pixels = [255, 0, 0, 0, 3, 2, 1, 0, 0, 0, 255, 0, 0, 255, 0, 0];
+        let body = dib(2, 2, 32, 0, &pixels);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&((14 + body.len()) as u32).to_le_bytes()); // bfSize
+        file.extend_from_slice(&0u32.to_le_bytes());                        // bfReserved
+        file.extend_from_slice(&54u32.to_le_bytes());                       // bfOffBits = 14 + header
+        file.extend_from_slice(&body);
+        let (w, h, rgba) = dib_to_rgba(&file).expect("a whole BMP must decode too");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "top-left must be red");
+    }
+
+    #[test]
+    fn unusable_dib_layouts_are_refused_rather_than_misread() {
+        assert!(dib_to_rgba(&dib(2, 2, 8, 0, &[0; 4])).is_none(), "paletted 8 bpp is not handled");
+        assert!(dib_to_rgba(&dib(2, 2, 32, 1, &[0; 16])).is_none(), "BI_RLE compression is not raw pixels");
+        assert!(dib_to_rgba(&dib(0, 2, 32, 0, &[0; 16])).is_none(), "zero width");
+        let mut short = dib(2, 2, 32, 0, &[]) ; short.truncate(40);
+        assert!(dib_to_rgba(&short).is_none(), "a header with no pixel data is not an image");
+        assert!(dib_to_rgba(&[]).is_none());
     }
 
     /// Restores the user's clipboard even if an assertion panics mid-test.
